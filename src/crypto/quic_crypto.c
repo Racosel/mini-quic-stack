@@ -12,7 +12,7 @@ static int quic_hkdf_extract(const uint8_t *salt, size_t salt_len, const uint8_t
 
     if (EVP_PKEY_derive_init(pctx) > 0 &&
         EVP_PKEY_CTX_hkdf_mode(pctx, EVP_PKEY_HKDEF_MODE_EXTRACT_ONLY) > 0 &&
-        EVP_PKEY_CTX_set_hkdf_md(pctx, EVP_MD_sha256()) > 0 &&
+        EVP_PKEY_CTX_set_hkdf_md(pctx, EVP_sha256()) > 0 &&
         EVP_PKEY_CTX_set1_hkdf_salt(pctx, salt, salt_len) > 0 &&
         EVP_PKEY_CTX_set1_hkdf_key(pctx, ikm, ikm_len) > 0 &&
         EVP_PKEY_derive(pctx, prk, &prk_len) > 0) {
@@ -32,7 +32,7 @@ static int quic_hkdf_expand(const uint8_t *prk, const uint8_t *info, size_t info
 
     if (EVP_PKEY_derive_init(pctx) > 0 &&
         EVP_PKEY_CTX_hkdf_mode(pctx, EVP_PKEY_HKDEF_MODE_EXPAND_ONLY) > 0 &&
-        EVP_PKEY_CTX_set_hkdf_md(pctx, EVP_MD_sha256()) > 0 &&
+        EVP_PKEY_CTX_set_hkdf_md(pctx, EVP_sha256()) > 0 &&
         EVP_PKEY_CTX_set1_hkdf_key(pctx, prk, QUIC_MD_HASH_SIZE) > 0 &&
         EVP_PKEY_CTX_add1_hkdf_info(pctx, info, info_len) > 0 &&
         EVP_PKEY_derive(pctx, out, &len) > 0) {

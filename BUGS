@@ -11,4 +11,41 @@ src/transport/udp_io.c:3:10: fatal error: pkt_decode.h: No such file or director
 compilation terminated.
 ```
 
-2.
+### Phase 2
+None.
+
+### Phase 3
+1. complie fail, OpenSSL has EVP_sha256() rather than EVP_MD_sha256()
+```c
+gcc -Wall -Wextra -g -O0 -I./include tests/test_phase3.c src/packet/pkt_decode.c src/packet/quic_version.c src/crypto/quic_crypto.c -o test_phase3_bin -lcrypto
+src/crypto/quic_crypto.c: In function ‘quic_hkdf_extract’:
+src/crypto/quic_crypto.c:15:40: warning: implicit declaration of function ‘EVP_MD_sha256’; did you mean ‘EVP_sha256’? [-Wimplicit-function-declaration]
+   15 |         EVP_PKEY_CTX_set_hkdf_md(pctx, EVP_MD_sha256()) > 0 &&
+      |                                        ^~~~~~~~~~~~~
+      |                                        EVP_sha256
+src/crypto/quic_crypto.c:15:40: warning: passing argument 2 of ‘EVP_PKEY_CTX_set_hkdf_md’ makes pointer from integer without a cast [-Wint-conversion]
+   15 |         EVP_PKEY_CTX_set_hkdf_md(pctx, EVP_MD_sha256()) > 0 &&
+      |                                        ^~~~~~~~~~~~~~~
+      |                                        |
+      |                                        int
+In file included from src/crypto/quic_crypto.c:4:
+/usr/include/openssl/kdf.h:105:63: note: expected ‘const EVP_MD *’ {aka ‘const struct evp_md_st *’} but argument is of type ‘int’
+  105 | int EVP_PKEY_CTX_set_hkdf_md(EVP_PKEY_CTX *ctx, const EVP_MD *md);
+      |                                                 ~~~~~~~~~~~~~~^~
+src/crypto/quic_crypto.c: In function ‘quic_hkdf_expand’:
+src/crypto/quic_crypto.c:35:40: warning: passing argument 2 of ‘EVP_PKEY_CTX_set_hkdf_md’ makes pointer from integer without a cast [-Wint-conversion]
+   35 |         EVP_PKEY_CTX_set_hkdf_md(pctx, EVP_MD_sha256()) > 0 &&
+      |                                        ^~~~~~~~~~~~~~~
+      |                                        |
+      |                                        int
+In file included from src/crypto/quic_crypto.c:4:
+/usr/include/openssl/kdf.h:105:63: note: expected ‘const EVP_MD *’ {aka ‘const struct evp_md_st *’} but argument is of type ‘int’
+  105 | int EVP_PKEY_CTX_set_hkdf_md(EVP_PKEY_CTX *ctx, const EVP_MD *md);
+      |                                                 ~~~~~~~~~~~~~~^~
+/usr/bin/ld: /tmp/ccw8Kk4z.o: in function `quic_hkdf_extract':
+/home/racosel/Desktop/AI-QUIC/src/crypto/quic_crypto.c:15: undefined reference to `EVP_MD_sha256'
+/usr/bin/ld: /tmp/ccw8Kk4z.o: in function `quic_hkdf_expand':
+/home/racosel/Desktop/AI-QUIC/src/crypto/quic_crypto.c:35: undefined reference to `EVP_MD_sha256'
+collect2: error: ld returned 1 exit status
+make: *** [Makefile:42: test_phase3_bin] Error 1
+```
