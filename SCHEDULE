@@ -1,0 +1,102 @@
+### 1. UDP 报文接收与预检层 (UDP I/O & Pre-parsing)
+
+这是协议栈的入口，负责高效收取数据并进行最外层的粗略解析。
+
+* **批量读取**：使用 Linux 的 `recvmmsg` 从 UDP 套接字批量拉取数据报，减少上下文切换。
+* **首字节掩码判别**：检查数据包的第一个字节。提取 Header Form（判断是长头部还是短头部）。
+* **提取 DCID**：无论长短头部，提取 Destination Connection ID，用于在本地哈希表中匹配对应的 Connection 实例。
+
+### 2. 版本路由与长头部解析 (Version Routing & Header Parsing)
+
+这是 QUIC v2 与 v1 产生物理差异的第一处。
+
+* **版本号校验 (仅限长头部)**：
+* 提取 32-bit 的 Version 字段。
+* **v2 标准**：如果是 `0x6b3343cf`，则路由到 v2 处理逻辑。
+* **版本协商**：如果是未知版本，服务端直接构造并返回 Version Negotiation 包。如果客户端发起了 v1，服务端支持兼容版本协商（Compatible Version Negotiation），也可以在后续握手中平滑升级到 v2。
+
+
+* **包类型解码 (Packet Type)**：
+* **v2 标准变动**：在 v2 中，长头部包类型的 2-bit 标识被彻底打乱以防止网络中间件僵化：
+* `0b01` -> Initial
+* `0b10` -> 0-RTT
+* `0b11` -> Handshake
+* `0b00` -> Retry
+
+
+### 3. v2 定制化密码学引擎 (Cryptography & Security Engine)
+
+在解析出长头部类型后，需要剥离头部保护（Header Protection）并解密 Payload。这里是 RFC 9369 修改的核心地带。
+
+* **派生 Initial 密钥**：
+* **v2 标准**：必须使用 v2 专用的 Initial Salt (`0x0dede3def700a6db819381be6e269dcbf9bd2ed9`) 进行 HKDF-Extract。
+
+
+* **派生读写密钥与 IV**：
+* **v2 标准**：使用新的 HKDF Labels 展开密钥。从 v1 的 `"quic key"` 和 `"quic iv"`，严格替换为 `"quicv2 key"` 和 `"quicv2 iv"`。
+
+
+* **防放大攻击 (Retry 验证)**：
+* 如果收到 Retry 数据包，其完整性标签 (Integrity Tag) 的计算依赖于底层的 Secret、Key 和 Nonce。在 v2 中，必须使用由 sha256("QUICv2 retry secret") 派生出的全新常量集进行验证。
+
+
+* **解密执行**：利用上述派生出的密钥，执行 AES-GCM 或 ChaCha20-Poly1305 解密，获得明文的 QUIC 帧集合。
+
+### 4. 帧解析与多路复用解包 (Frame Decoding & Demultiplexing)
+
+一旦 Payload 解密成功，版本差异就被抹平了，后续逻辑与 v1 (RFC 9000) 完全一致。
+
+* **遍历帧序列**：在一个明文 Payload 中循环读取帧类型（Type）。
+* **分离控制流与数据流**：
+* 将 `ACK`、`MAX_DATA`、`PATH_CHALLENGE` 等控制帧交给 Connection 状态机。
+* 将 `CRYPTO` 帧交给 TLS 1.3 引擎处理握手状态。
+* 将 `STREAM` 帧中的应用数据，根据 Stream ID 放入对应流的乱序重组环形缓冲区（Ring Buffer）中。
+
+
+### Stage 5: 可靠传输与拥塞控制 (RFC 9002)
+
+这一阶段的核心是**“追踪与恢复”**。由于底层 UDP 是不可靠的，我们需要建立机制来确保发送的数据包最终都能被对方收到。
+
+* **5.1 飞行队列与包号管理 (In-flight Queue & Packet Numbering)**
+* **目标**：维护一个本地数据结构（如双向链表或环形数组），记录所有**已发送但尚未被确认**的数据包的元数据（包号、发送时间、包含的帧类型、数据长度）。
+* **难点**：QUIC 的 Packet Number 永远递增，不随重传而复位。需要设计高效的查找和剔除机制。
+
+
+* **5.2 ACK 帧解析与 RTT 采样 (ACK Parsing & RTT Measurement)**
+* **目标**：QUIC 的 `ACK` 帧非常复杂，支持多个确认区间（ACK Ranges）以应对严重的乱序到达。
+* **任务**：编写解码器解析 `ACK` 帧中的最大确认包号、ACK 延迟以及不连续的包号块。根据解析结果计算最新的平滑往返时间（Smoothed RTT）和 RTT 方差。
+
+
+* **5.3 丢包探测与重传状态机 (Loss Detection & PTO)**
+* **目标**：决定何时认定一个数据包已经丢失，并将其中的关键帧重新打包发送。
+* **任务**：实现基于时间的**探测超时（PTO, Probe Timeout）**定时器，以及基于包号的快速重传（如果收到确认包号 N，则认定 N - 3 之前的包已丢失）。
+
+
+* **5.4 拥塞控制算法 (Congestion Control - NewReno)**
+* **目标**：防止发送方过载网络。
+* **任务**：维护拥塞窗口（`cwnd`）和慢启动阈值（`ssthresh`）。在收到 `ACK` 时增加窗口（慢启动/拥塞避免阶段），在触发丢包时减小窗口。
+
+
+
+### Stage 6: 流管理、流量控制与发送流水线 (Stream & Transmission)
+
+这一阶段的核心是**“组装与发射”**。负责将应用层的乱序数据拼好，并将本地要发的数据安全地推向网络。
+
+* **6.1 流状态机与乱序重组缓冲区 (Stream State & Reassembly Buffer)**
+* **目标**：管理单向/双向流的生命周期（Open, Half-closed, Closed）。
+* **任务**：网络包可能乱序到达，必须为每个活跃的 Stream 分配一个**接收环形缓冲区（Ring Buffer）**。根据 `STREAM` 帧中的 Offset 字段，将分片的数据拼装成连续的字节流供应用层读取。
+
+
+* **6.2 流量控制机制 (Flow Control)**
+* **目标**：防止对端发送过快导致本地内存溢出（OOM）。
+* **任务**：解析和生成 `MAX_DATA`（连接级别限制）和 `MAX_STREAM_DATA`（流级别限制）帧。严格跟踪当前已消耗的配额，当额度不足时发送 `DATA_BLOCKED`。
+
+
+* **6.3 报文组装与头部保护 (Packet Assembly & Header Protection)**
+* **目标**：将准备好的帧（`STREAM`, `ACK` 等）打包成 QUIC 报文格式。
+* **任务**：这是 Stage 3 和 4 的逆过程。分配 Packet Number -> 生成长/短头部 -> 用 AES-GCM/ChaCha20 加密 Payload -> **应用 Header Protection 掩码混淆包号**。
+
+
+* **6.4 批量发送与定时器驱动 (Batch Transmission & Event Loop)**
+* **目标**：高性能地将数据推入网卡。
+* **任务**：整合底层的 `sendmmsg` 接口。结合系统的 `epoll` 或定时器轮，在 PTO 到期或有新数据就绪时，批量将加密好的 QUIC 报文发送出去。
