@@ -59,6 +59,18 @@ test4: $(BIN_TEST_PHASE4)
 	@echo "--- Executing Phase 4 Tests (Frame Parsing) ---"
 	./$(BIN_TEST_PHASE4)
 
+SRC_RECOVERY = src/recovery/loss_detector.c
+SRC_TEST_PHASE5_1 = tests/test_phase5_1.c
+BIN_TEST_PHASE5_1 = test_phase5_1_bin
+
+all: $(BIN_TEST_PHASE5_1)
+
+$(BIN_TEST_PHASE5_1): $(SRC_TEST_PHASE5_1) $(SRC_RECOVERY)
+	$(CC) $(CFLAGS) $(INCLUDES) $^ -o $@
+
+test5_1: $(BIN_TEST_PHASE5_1)
+	./$(BIN_TEST_PHASE5_1)
+
 # ==========================================
 # Network & Clean
 # ==========================================
