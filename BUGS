@@ -1,0 +1,14 @@
+### Phase 1
+1. move all `.h` to `\include`
+```c
+src/packet/pkt_decode.c: In function ‘quic_parse_header_meta’:
+src/packet/pkt_decode.c:33:53: warning: comparison of integer expressions of different signedness: ‘size_t’ {aka ‘long unsigned int’} and ‘int’ [-Wsign-compare]
+   33 |         if (meta->dest_cid.len > MAX_CID_LEN || len < 6 + meta->dest_cid.len + 1) {
+      |                                                     ^
+src/transport/udp_io.c:3:10: fatal error: pkt_decode.h: No such file or directory
+    3 | #include "pkt_decode.h"
+      |          ^~~~~~~~~~~~~~
+compilation terminated.
+```
+
+2.

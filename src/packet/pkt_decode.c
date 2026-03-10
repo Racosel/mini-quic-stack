@@ -30,7 +30,8 @@ int quic_parse_header_meta(const uint8_t *data, size_t len, quic_pkt_header_meta
 
         // 提取 DCID
         meta->dest_cid.len = data[5];
-        if (meta->dest_cid.len > MAX_CID_LEN || len < 6 + meta->dest_cid.len + 1) {
+        // 修改此处：将算术结果强制转换为 size_t 消除警告
+        if (meta->dest_cid.len > MAX_CID_LEN || len < (size_t)(7 + meta->dest_cid.len)) {
             return -4;
         }
         memcpy(meta->dest_cid.data, &data[6], meta->dest_cid.len);
@@ -38,7 +39,8 @@ int quic_parse_header_meta(const uint8_t *data, size_t len, quic_pkt_header_meta
         // 提取 SCID
         size_t scid_offset = 6 + meta->dest_cid.len;
         meta->src_cid.len = data[scid_offset];
-        if (meta->src_cid.len > MAX_CID_LEN || len < scid_offset + 1 + meta->src_cid.len) {
+        // 修改此处：强制转换消除警告
+        if (meta->src_cid.len > MAX_CID_LEN || len < scid_offset + 1 + (size_t)meta->src_cid.len) {
             return -5;
         }
         memcpy(meta->src_cid.data, &data[scid_offset + 1], meta->src_cid.len);
