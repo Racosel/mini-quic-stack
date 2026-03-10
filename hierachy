@@ -1,0 +1,38 @@
+quic_stack_c/
+├── include/                    # 公共头文件 (对外 API 及内部核心抽象)
+│   ├── quic_api.h              # 面向应用层的 API (quic_endpoint_t, quic_conn_t, quic_stream_t)
+│   ├── quic_types.h            # 基础数据结构 (CID, 各种结构体前置声明)
+│   ├── quic_error.h            # 错误码定义
+│   └── util_varint.h           # 变长整数编解码宏与内联函数
+├── src/                        # 源文件实现
+│   ├── transport/              # 底层网络与事件驱动 (对应步骤1)
+│   │   ├── epoll_loop.c        # Linux epoll 事件循环包装器
+│   │   ├── udp_io.c            # UDP 套接字收发 (封装 sendmmsg/recvmmsg 以提升性能)
+│   │   └── dispatcher.c        # 分发器：解析短/长头部，基于 CID 将包路由给对应 Connection
+│   ├── packet/                 # 数据包处理 (对应步骤1、3)
+│   │   ├── pkt_decode.c        # 字节流 -> QUIC Packet 结构体转换
+│   │   ├── pkt_encode.c        # QUIC Packet 结构体 -> 字节流序列化
+│   │   └── version.c           # v1 与 v2 版本判断与 Version Negotiation 包生成
+│   ├── frame/                  # 帧解析与组装 (对应步骤4)
+│   │   ├── frame_decode.c      # 解析 STREAM, ACK, MAX_DATA 等帧
+│   │   └── frame_encode.c      # 序列化各类型帧
+│   ├── crypto/                 # 加密与 TLS 层 (对应步骤2)
+│   │   ├── tls_adapter.c       # 集成外部 TLS 库 (如 quictls 或 picotls)
+│   │   ├── key_derivation.c    # 密钥派生：根据 v1/v2 注入不同的 Salt 和 HKDF Labels
+│   │   └── aead_cipher.c       # 头部保护 (Header Protection) 与 Payload 的解密/加密
+│   ├── core/                   # 核心状态机 (对应步骤5、6)
+│   │   ├── connection.c        # Connection 实例管理、握手流程、生命周期
+│   │   ├── stream.c            # Stream 的创建、销毁及优先级
+│   │   ├── stream_buf.c        # 基于环形缓冲区 (Ring Buffer) 的乱序重组与发送队列
+│   │   └── flow_control.c      # 连接级与流级的接收/发送窗口管理
+│   └── recovery/               # 丢包与拥塞控制 (对应步骤5)
+│       ├── loss_detector.c     # 定时器管理、PTO 计算、RTT 采样
+│       ├── cc_newreno.c        # 标准 NewReno 拥塞控制算法实现
+│       └── packet_tracker.c    # 记录 In-flight (飞行中) 数据包，处理 ACK
+├── third_party/                # 第三方依赖
+│   ├── khash/                  # 轻量级哈希表 (用于 CID -> Connection 的快速查找)
+│   └── picotls/                # TLS 1.3 引擎 (提供 QUIC 必需的密钥导出接口)
+├── tests/                      # 单元测试 (集成 CUnit 或 Unity)
+└── examples/                   # 示例程序
+    ├── server.c                # 使用 epoll 和 udp_io 启动的 QUIC 服务端
+    └── client.c                # QUIC 客户端实现
