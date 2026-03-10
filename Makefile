@@ -18,6 +18,7 @@ BIN_TEST_PHASE1 = test_phase1_bin
 BIN_TEST_PHASE2 = test_phase2_bin
 BIN_TEST_PHASE3 = test_phase3_bin
 BIN_TEST_PHASE4 = test_phase4_bin
+BIN_TESTS = $(BIN_TEST_PHASE1) $(BIN_TEST_PHASE2) $(BIN_TEST_PHASE3) $(BIN_TEST_PHASE4)
 
 
 .PHONY: all test1 test2 test3 test4 clean net
@@ -71,14 +72,16 @@ $(BIN_TEST_PHASE5_1): $(SRC_TEST_PHASE5_1) $(SRC_RECOVERY)
 test5_1: $(BIN_TEST_PHASE5_1)
 	./$(BIN_TEST_PHASE5_1)
 
+BIN_TESTS += $(BIN_TEST_PHASE5_1)
+
 # ==========================================
 # Network & Clean
 # ==========================================
 net:
-	sudo python3 quic_testnet.py
+	sudo python3 topo.py
 
 clean:
-	rm -f $(BIN_TEST_PHASE1) $(BIN_TEST_PHASE2) $(BIN_TEST_PHASE3) *.o
+	rm -f $(BIN_TESTS) *.o
 	sudo mn -c > /dev/null 2>&1
 	-sudo fuser -k 6653/tcp > /dev/null 2>&1
 	-sudo fuser -k 4434/udp > /dev/null 2>&1 || true
