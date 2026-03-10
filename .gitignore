@@ -12,6 +12,8 @@
 # ==========================================
 test_phase1_bin
 test_phase2_bin
+test_phase3_bin
+test_phase4_bin
 quic_server
 quic_client
 

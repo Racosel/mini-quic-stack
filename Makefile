@@ -24,6 +24,7 @@ BIN_TEST_PHASE4 = test_phase4_bin
 
 all: $(BIN_TEST_PHASE1) $(BIN_TEST_PHASE2) $(BIN_TEST_PHASE3) $(BIN_TEST_PHASE4)
 
+
 # ==========================================
 # Phase 1 / Phase 2 Rules
 # ==========================================
