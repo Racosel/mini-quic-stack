@@ -7,18 +7,22 @@ SRC_PACKET = src/packet/pkt_decode.c
 SRC_TRANSPORT = src/transport/udp_io.c
 SRC_VERSION = src/packet/quic_version.c
 SRC_CRYPTO = src/crypto/quic_crypto.c
+SRC_FRAME = src/packet/quic_varint.c src/frame/frame_decode.c
 
 SRC_TEST_PHASE1 = tests/test_phase1.c
 SRC_TEST_PHASE2 = tests/test_phase2.c
 SRC_TEST_PHASE3 = tests/test_phase3.c
+SRC_TEST_PHASE4 = tests/test_phase4.c
 
 BIN_TEST_PHASE1 = test_phase1_bin
 BIN_TEST_PHASE2 = test_phase2_bin
 BIN_TEST_PHASE3 = test_phase3_bin
+BIN_TEST_PHASE4 = test_phase4_bin
 
-.PHONY: all test1 test2 test3 clean net
 
-all: $(BIN_TEST_PHASE1) $(BIN_TEST_PHASE2) $(BIN_TEST_PHASE3)
+.PHONY: all test1 test2 test3 test4 clean net
+
+all: $(BIN_TEST_PHASE1) $(BIN_TEST_PHASE2) $(BIN_TEST_PHASE3) $(BIN_TEST_PHASE4)
 
 # ==========================================
 # Phase 1 / Phase 2 Rules
@@ -43,6 +47,16 @@ $(BIN_TEST_PHASE3): $(SRC_TEST_PHASE3) $(SRC_PACKET) $(SRC_VERSION) $(SRC_CRYPTO
 
 test3: $(BIN_TEST_PHASE3)
 	./$(BIN_TEST_PHASE3)
+
+# ==========================================
+# Phase 4 Rules (Frame Parsing)
+# ==========================================
+$(BIN_TEST_PHASE4): $(SRC_TEST_PHASE4) $(SRC_FRAME)
+	$(CC) $(CFLAGS) $(INCLUDES) $^ -o $@
+
+test4: $(BIN_TEST_PHASE4)
+	@echo "--- Executing Phase 4 Tests (Frame Parsing) ---"
+	./$(BIN_TEST_PHASE4)
 
 # ==========================================
 # Network & Clean
