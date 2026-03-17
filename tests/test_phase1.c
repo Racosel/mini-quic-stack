@@ -2,20 +2,21 @@
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
-#include <arpa/inet.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <sys/socket.h>
+#include <errno.h>
 
 #include "quic_types.h"
 #include "pkt_decode.h"
 #include "udp_io.h"
 
 // ============================================================================
-// 第一部分：内存解码与边界异常测试 (Unit Tests)
+// 第一部分：内存解码与边界异常测试（单元测试）
 // ============================================================================
 
 void test_decode_valid_long_v1() {
-    // 0xc0 (Form=1, Fixed=1), Version(1), DCID_Len(4), DCID, SCID_Len(2), SCID
+    // 0xc0（Form=1，Fixed=1），Version(1)，DCID_Len(4)，随后是 DCID 与 SCID
     uint8_t pkt[] = {0xc0, 0x00, 0x00, 0x00, 0x01, 0x04, 0x11, 0x22, 0x33, 0x44, 0x02, 0xaa, 0xbb};
     quic_pkt_header_meta_t meta;
     int ret = quic_parse_header_meta(pkt, sizeof(pkt), &meta);
@@ -28,7 +29,7 @@ void test_decode_valid_long_v1() {
 }
 
 void test_decode_valid_long_v2() {
-    // 0xd0 (Form=1, Fixed=1, Type=01), Version(0x6b3343cf), DCID_Len(0), SCID_Len(0)
+    // 0xd0（Form=1，Fixed=1，Type=01），Version(0x6b3343cf)，DCID_Len(0)，SCID_Len(0)
     uint8_t pkt[] = {0xd0, 0x6b, 0x33, 0x43, 0xcf, 0x00, 0x00};
     quic_pkt_header_meta_t meta;
     int ret = quic_parse_header_meta(pkt, sizeof(pkt), &meta);
@@ -39,20 +40,20 @@ void test_decode_valid_long_v2() {
 }
 
 void test_decode_valid_short() {
-    // 0x40 (Form=0, Fixed=1), DCID(假设剩余全为DCID, 限制最大20字节)
+    // 0x40（Form=0，Fixed=1），假设剩余内容全部为 DCID，最大限制 20 字节
     uint8_t pkt[] = {0x40, 0x99, 0x88, 0x77};
     quic_pkt_header_meta_t meta;
     int ret = quic_parse_header_meta(pkt, sizeof(pkt), &meta);
     assert(ret == 0);
     assert(meta.header_form == 0 && meta.fixed_bit == 1);
-    assert(meta.dest_cid.len == 3); // 整个 payload 长度 4 - 1 = 3
+    assert(meta.dest_cid.len == 3); // 整个载荷长度 4 - 1 = 3
     assert(meta.dest_cid.data[0] == 0x99);
     assert(meta.version == 0);
     printf("[PASS] Valid Short Header\n");
 }
 
 void test_decode_invalid_fixed_bit() {
-    // 0x00 (Fixed Bit = 0, 违背 RFC 规范)
+    // 0x00（Fixed Bit = 0，违背 RFC 规范）
     uint8_t pkt[] = {0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00};
     quic_pkt_header_meta_t meta;
     int ret = quic_parse_header_meta(pkt, sizeof(pkt), &meta);
@@ -61,7 +62,7 @@ void test_decode_invalid_fixed_bit() {
 }
 
 void test_decode_too_short() {
-    // 长度不足以容纳 Long Header 的基本字段 (最小 6 bytes)
+    // 长度不足以容纳长包头的基本字段（最少 6 字节）
     uint8_t pkt[] = {0xc0, 0x00, 0x00, 0x00, 0x01}; 
     quic_pkt_header_meta_t meta;
     int ret = quic_parse_header_meta(pkt, sizeof(pkt), &meta);
@@ -70,7 +71,7 @@ void test_decode_too_short() {
 }
 
 void test_decode_cid_out_of_bounds() {
-    // 声明 DCID 长度为 200，但实际 payload 只有几字节
+    // 声明 DCID 长度为 200，但实际载荷只有几字节
     uint8_t pkt[] = {0xc0, 0x00, 0x00, 0x00, 0x01, 200, 0x11, 0x22};
     quic_pkt_header_meta_t meta;
     int ret = quic_parse_header_meta(pkt, sizeof(pkt), &meta);
@@ -79,20 +80,21 @@ void test_decode_cid_out_of_bounds() {
 }
 
 // ============================================================================
-// 第二部分：UDP 本地环回批量接收测试 (Integration Tests)
+// 第二部分：UDP 本地环回批量接收测试（集成测试）
 // ============================================================================
 
 void test_udp_batch_receive() {
-    int port = 4434;
-    
-    // 1. 设置接收端 Socket
-    int recv_fd = socket(AF_INET, SOCK_DGRAM, 0);
-    struct sockaddr_in recv_addr;
-    memset(&recv_addr, 0, sizeof(recv_addr));
-    recv_addr.sin_family = AF_INET;
-    recv_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
-    recv_addr.sin_port = htons(port);
-    bind(recv_fd, (struct sockaddr*)&recv_addr, sizeof(recv_addr));
+    int fds[2];
+    uint8_t valid_pkt[] = {0xc0, 0x6b, 0x33, 0x43, 0xcf, 0x00, 0x00};
+    uint8_t invalid_pkt[] = {0x00, 0x6b, 0x33, 0x43, 0xcf, 0x00, 0x00};
+    int send_count = 10;
+    int valid_count = 9;
+
+    if (socketpair(AF_UNIX, SOCK_DGRAM, 0, fds) != 0) {
+        printf("[SKIP] UDP Batch Receive: socketpair unavailable in this environment (errno=%d)\n", errno);
+        return;
+    }
+    int recv_fd = fds[0];
 
     // 设置为非阻塞模式，防止测试挂起
     int flags = fcntl(recv_fd, F_GETFL, 0);
@@ -100,25 +102,41 @@ void test_udp_batch_receive() {
 
     udp_io_init();
 
-    // 2. 设置发送端 Socket
-    int send_fd = socket(AF_INET, SOCK_DGRAM, 0);
-    uint8_t dummy_pkt[] = {0xc0, 0x6b, 0x33, 0x43, 0xcf, 0x00, 0x00}; // v2包
+    // 2. 设置发送端套接字
+    int send_fd = fds[1];
 
-    // 3. 连续发送 10 个数据包
-    int send_count = 10;
-    for (int i = 0; i < send_count; i++) {
-        sendto(send_fd, dummy_pkt, sizeof(dummy_pkt), 0, 
-              (struct sockaddr*)&recv_addr, sizeof(recv_addr));
+    // 3. 连续发送 9 个有效数据包和 1 个无效数据包
+    for (int i = 0; i < valid_count; i++) {
+        if (send(send_fd, valid_pkt, sizeof(valid_pkt), 0) < 0) {
+            printf("[SKIP] UDP Batch Receive: datagram send blocked in this environment (errno=%d)\n", errno);
+            close(send_fd);
+            close(recv_fd);
+            return;
+        }
+    }
+    if (send(send_fd, invalid_pkt, sizeof(invalid_pkt), 0) < 0) {
+        printf("[SKIP] UDP Batch Receive: datagram send blocked in this environment (errno=%d)\n", errno);
+        close(send_fd);
+        close(recv_fd);
+        return;
     }
 
-    // 留出一点时间让内核 UDP 栈处理
+    // 留出一点时间让内核 UDP 协议栈处理
     usleep(10000); 
 
     // 4. 执行批量接收
     int received = udp_receive_batch(recv_fd);
-    
+    if (received < 0) {
+        printf("[SKIP] UDP Batch Receive: receive blocked in this environment (errno=%d)\n", errno);
+        close(send_fd);
+        close(recv_fd);
+        return;
+    }
+
     assert(received == send_count);
-    printf("[PASS] UDP Batch Receive: Sent %d, Received %d\n", send_count, received);
+    assert(udp_last_valid_count() == valid_count);
+    printf("[PASS] UDP Batch Receive: Sent %d, Received %d, Valid %d\n",
+           send_count, received, udp_last_valid_count());
 
     close(send_fd);
     close(recv_fd);

@@ -10,16 +10,27 @@
 #define QUIC_HP_KEY_SIZE 16   // 头部保护密钥长度
 
 typedef struct {
-    uint8_t secret[QUIC_MD_HASH_SIZE]; // Initial Secret
+    uint8_t secret[QUIC_MD_HASH_SIZE]; // 初始密钥材料
     uint8_t key[QUIC_AEAD_KEY_SIZE];   // AEAD 读/写密钥
     uint8_t iv[QUIC_AEAD_IV_SIZE];     // AEAD 初始化向量
-    uint8_t hp[QUIC_HP_KEY_SIZE];      // Header Protection 密钥
+    uint8_t hp[QUIC_HP_KEY_SIZE];      // 头部保护密钥
 } quic_crypto_level_ctx_t;
 
 typedef struct {
     quic_crypto_level_ctx_t client_initial;
     quic_crypto_level_ctx_t server_initial;
 } quic_crypto_context_t;
+
+// 基于 TLS 提供的 QUIC secret 推导该级别的包保护密钥
+int quic_crypto_derive_packet_keys(
+    const uint8_t *secret,
+    size_t secret_len,
+    const quic_version_ops_t *v_ops,
+    quic_crypto_level_ctx_t *ctx
+);
+
+// 清空某个加密级别的密钥材料
+void quic_crypto_discard_level(quic_crypto_level_ctx_t *ctx);
 
 // 初始化 QUIC 的 Initial 密钥上下文
 int quic_crypto_setup_initial_keys(
@@ -28,4 +39,4 @@ int quic_crypto_setup_initial_keys(
     quic_crypto_context_t *ctx
 );
 
-#endif // QUIC_CRYPTO_H
+#endif // QUIC_CRYPTO_H：头文件保护结束

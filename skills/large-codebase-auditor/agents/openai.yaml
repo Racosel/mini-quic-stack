@@ -1,0 +1,4 @@
+interface:
+  display_name: "大型代码库审查器"
+  short_description: "审查大型代码库并交付稳妥修复"
+  default_prompt: "使用 $large-codebase-auditor 审查大型仓库、识别风险、实施修复，并同步更新相关文档。"

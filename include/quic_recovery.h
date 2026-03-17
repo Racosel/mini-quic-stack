@@ -28,4 +28,4 @@ void quic_queue_init(quic_in_flight_queue_t *q);
 void quic_on_packet_sent(quic_in_flight_queue_t *q, uint64_t pn, size_t len, int ack_eliciting);
 void quic_on_packet_acked(quic_in_flight_queue_t *q, uint64_t pn);
 
-#endif
+#endif // QUIC_RECOVERY_H：头文件保护结束

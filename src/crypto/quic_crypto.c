@@ -43,7 +43,7 @@ static int quic_hkdf_expand(const uint8_t *prk, const uint8_t *info, size_t info
     return ret;
 }
 
-static int quic_hkdf_expand_label(const uint8_t *secret, const char *label, uint16_t out_len, uint8_t *out) {
+static int quic_hkdf_expand_label(const uint8_t *secret, size_t secret_len, const char *label, uint16_t out_len, uint8_t *out) {
     const char *prefix = "tls13 ";
     size_t prefix_len = 6;
     size_t label_len = strlen(label);
@@ -60,9 +60,44 @@ static int quic_hkdf_expand_label(const uint8_t *secret, const char *label, uint
     memcpy(&hkdf_info[info_offset], label, label_len);
     info_offset += label_len;
 
-    hkdf_info[info_offset++] = 0x00; // Context Length = 0
+    hkdf_info[info_offset++] = 0x00; // 上下文长度为 0
+
+    if (secret_len != QUIC_MD_HASH_SIZE) {
+        return -1;
+    }
 
     return quic_hkdf_expand(secret, hkdf_info, info_offset, out, out_len);
+}
+
+int quic_crypto_derive_packet_keys(
+    const uint8_t *secret,
+    size_t secret_len,
+    const quic_version_ops_t *v_ops,
+    quic_crypto_level_ctx_t *ctx
+) {
+    uint8_t secret_copy[QUIC_MD_HASH_SIZE];
+
+    if (!secret || !v_ops || !ctx) {
+        return -1;
+    }
+    if (secret_len != QUIC_MD_HASH_SIZE) {
+        return -1;
+    }
+
+    memcpy(secret_copy, secret, secret_len);
+    memset(ctx, 0, sizeof(*ctx));
+    memcpy(ctx->secret, secret_copy, secret_len);
+    if (quic_hkdf_expand_label(ctx->secret, secret_len, v_ops->hkdf_label_key, QUIC_AEAD_KEY_SIZE, ctx->key) != 0) return -1;
+    if (quic_hkdf_expand_label(ctx->secret, secret_len, v_ops->hkdf_label_iv, QUIC_AEAD_IV_SIZE, ctx->iv) != 0) return -1;
+    if (quic_hkdf_expand_label(ctx->secret, secret_len, v_ops->hkdf_label_hp, QUIC_HP_KEY_SIZE, ctx->hp) != 0) return -1;
+    return 0;
+}
+
+void quic_crypto_discard_level(quic_crypto_level_ctx_t *ctx) {
+    if (!ctx) {
+        return;
+    }
+    memset(ctx, 0, sizeof(*ctx));
 }
 
 int quic_crypto_setup_initial_keys(const quic_cid_t *dcid, const quic_version_ops_t *v_ops, quic_crypto_context_t *ctx) {
@@ -72,16 +107,11 @@ int quic_crypto_setup_initial_keys(const quic_cid_t *dcid, const quic_version_op
 
     if (quic_hkdf_extract(v_ops->initial_salt, v_ops->salt_len, dcid->data, dcid->len, initial_secret) != 0) return -1;
 
-    if (quic_hkdf_expand_label(initial_secret, "client in", QUIC_MD_HASH_SIZE, ctx->client_initial.secret) != 0) return -1;
-    if (quic_hkdf_expand_label(initial_secret, "server in", QUIC_MD_HASH_SIZE, ctx->server_initial.secret) != 0) return -1;
+    if (quic_hkdf_expand_label(initial_secret, sizeof(initial_secret), "client in", QUIC_MD_HASH_SIZE, ctx->client_initial.secret) != 0) return -1;
+    if (quic_hkdf_expand_label(initial_secret, sizeof(initial_secret), "server in", QUIC_MD_HASH_SIZE, ctx->server_initial.secret) != 0) return -1;
 
-    if (quic_hkdf_expand_label(ctx->client_initial.secret, v_ops->hkdf_label_key, QUIC_AEAD_KEY_SIZE, ctx->client_initial.key) != 0) return -1;
-    if (quic_hkdf_expand_label(ctx->client_initial.secret, v_ops->hkdf_label_iv, QUIC_AEAD_IV_SIZE, ctx->client_initial.iv) != 0) return -1;
-    if (quic_hkdf_expand_label(ctx->client_initial.secret, v_ops->hkdf_label_hp, QUIC_HP_KEY_SIZE, ctx->client_initial.hp) != 0) return -1;
-
-    if (quic_hkdf_expand_label(ctx->server_initial.secret, v_ops->hkdf_label_key, QUIC_AEAD_KEY_SIZE, ctx->server_initial.key) != 0) return -1;
-    if (quic_hkdf_expand_label(ctx->server_initial.secret, v_ops->hkdf_label_iv, QUIC_AEAD_IV_SIZE, ctx->server_initial.iv) != 0) return -1;
-    if (quic_hkdf_expand_label(ctx->server_initial.secret, v_ops->hkdf_label_hp, QUIC_HP_KEY_SIZE, ctx->server_initial.hp) != 0) return -1;
+    if (quic_crypto_derive_packet_keys(ctx->client_initial.secret, sizeof(ctx->client_initial.secret), v_ops, &ctx->client_initial) != 0) return -1;
+    if (quic_crypto_derive_packet_keys(ctx->server_initial.secret, sizeof(ctx->server_initial.secret), v_ops, &ctx->server_initial) != 0) return -1;
 
     return 0;
 }

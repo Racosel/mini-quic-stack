@@ -9,7 +9,7 @@ void test_in_flight_management() {
     // 模拟发送 3 个包
     quic_on_packet_sent(&q, 100, 1200, 1);
     quic_on_packet_sent(&q, 101, 1200, 1);
-    quic_on_packet_sent(&q, 102, 500, 0); // 非 ack-eliciting
+    quic_on_packet_sent(&q, 102, 500, 0); // 非 ACK 触发型数据包
 
     assert(q.bytes_in_flight == 2400);
 

@@ -5,10 +5,10 @@
 
 void test_varint_decode() {
     uint8_t data[] = {
-        0x25,                   // 1-byte: 37
-        0x40, 0x25,             // 2-byte: 37
-        0x9d, 0x7f, 0x3e, 0x7d, // 4-byte: 494878333
-        0xc2, 0x19, 0x7c, 0x5e, 0xff, 0x14, 0xe8, 0x8c // 8-byte: 151288809941952652
+        0x25,                   // 1 字节编码：37
+        0x40, 0x25,             // 2 字节编码：37
+        0x9d, 0x7f, 0x3e, 0x7d, // 4 字节编码：494878333
+        0xc2, 0x19, 0x7c, 0x5e, 0xff, 0x14, 0xe8, 0x8c // 8 字节编码：151288809941952652
     };
 
     size_t offset = 0;
@@ -30,12 +30,12 @@ void test_varint_decode() {
 }
 
 void test_frame_parsing() {
-    // 模拟解密后的明文 payload
-    // 包含: PADDING(0x00), PADDING(0x00), CRYPTO(0x06, offset=0, len=4, data="QUIC"), STREAM(0x0a: off=0, len=1, id=4, len=3, data="XYZ")
+    // 模拟解密后的明文载荷
+    // 包含：PADDING(0x00)、PADDING(0x00)、CRYPTO(0x06, offset=0, len=4, data="QUIC")、STREAM(0x0a: off=0, len=1, id=4, len=3, data="XYZ")
     uint8_t payload[] = {
         0x00, 0x00, 
         0x06, 0x00, 0x04, 'Q', 'U', 'I', 'C',
-        0x0a, 0x04, 0x03, 'X', 'Y', 'Z'  // 0x0a = 00001010 (STREAM, has_len=1)
+        0x0a, 0x04, 0x03, 'X', 'Y', 'Z'  // 0x0a = 00001010（STREAM，has_len=1）
     };
 
     int ret = quic_parse_frames(payload, sizeof(payload));

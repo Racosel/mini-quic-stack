@@ -3,7 +3,7 @@
 #include <stdio.h>
 
 // ============================================================================
-// v1 (RFC 9000) 常量与解析逻辑
+// v1（RFC 9000）常量与解析逻辑
 // ============================================================================
 static const uint8_t v1_salt[] = {
     0x38, 0x76, 0x2c, 0xf7, 0xf5, 0x59, 0x34, 0xb3, 
@@ -14,7 +14,7 @@ static const uint8_t v1_salt[] = {
 static uint8_t v1_decode_packet_type(uint8_t header_byte) {
     // 提取第 4 和 5 位 (0x30)
     uint8_t type = (header_byte & 0x30) >> 4;
-    // v1: 0=Initial, 1=0-RTT, 2=Handshake, 3=Retry
+    // v1：0=Initial，1=0-RTT，2=Handshake，3=Retry
     return type; 
 }
 
@@ -29,7 +29,7 @@ static const quic_version_ops_t v1_ops = {
 };
 
 // ============================================================================
-// v2 (RFC 9369) 常量与解析逻辑
+// v2（RFC 9369）常量与解析逻辑
 // ============================================================================
 static const uint8_t v2_salt[] = {
     0x0d, 0xed, 0xe3, 0xde, 0xf7, 0x00, 0xa6, 0xdb, 
@@ -65,19 +65,16 @@ static const quic_version_ops_t v2_ops = {
 
 const quic_version_ops_t* quic_version_get_ops(uint32_t version) {
     if (version == QUIC_V1_VERSION) {
-        printf("[DEBUG] Route to QUIC v1 (RFC 9000) profile.\n");
         return &v1_ops;
     } else if (version == QUIC_V2_VERSION) {
-        printf("[DEBUG] Route to QUIC v2 (RFC 9369) profile.\n");
         return &v2_ops;
     }
-    printf("[DEBUG] Unsupported version: 0x%08x\n", version);
     return NULL;
 }
 
 int quic_generate_version_negotiation(const quic_pkt_header_meta_t *in_meta, uint8_t *out_buf, size_t max_len) {
-    // 报文结构: Header(1) + Version(4=0x0) + DCID_Len(1) + DCID + SCID_Len(1) + SCID + Supported_Versions
-    // Version Negotiation 包将接收到的 SCID 作为 DCID，接收到的 DCID 作为 SCID
+    // 报文结构：Header(1) + Version(4=0x0) + DCID_Len(1) + DCID + SCID_Len(1) + SCID + Supported_Versions
+    // 版本协商包会将收到的 SCID 作为 DCID、收到的 DCID 作为 SCID
     size_t required_len = 1 + 4 + 1 + in_meta->src_cid.len + 1 + in_meta->dest_cid.len + 8; // 支持 v1 和 v2 (各4字节)
     
     if (max_len < required_len) {
@@ -86,26 +83,26 @@ int quic_generate_version_negotiation(const quic_pkt_header_meta_t *in_meta, uin
 
     size_t offset = 0;
     
-    // 1. 首字节 (必须设置 Long Header bit，其他位随机，RFC 规范为防特征识别)
+    // 1. 首字节（必须设置长包头标志位，其余位可随机，以降低特征识别）
     out_buf[offset++] = 0x80; 
     
-    // 2. Version 必须为 0x00000000
+    // 2. 版本字段必须为 0x00000000
     out_buf[offset++] = 0x00;
     out_buf[offset++] = 0x00;
     out_buf[offset++] = 0x00;
     out_buf[offset++] = 0x00;
 
-    // 3. DCID (来自收到的包的 SCID)
+    // 3. 写入 DCID（取自收到报文的 SCID）
     out_buf[offset++] = in_meta->src_cid.len;
     memcpy(&out_buf[offset], in_meta->src_cid.data, in_meta->src_cid.len);
     offset += in_meta->src_cid.len;
 
-    // 4. SCID (来自收到的包的 DCID)
+    // 4. 写入 SCID（取自收到报文的 DCID）
     out_buf[offset++] = in_meta->dest_cid.len;
     memcpy(&out_buf[offset], in_meta->dest_cid.data, in_meta->dest_cid.len);
     offset += in_meta->dest_cid.len;
 
-    // 5. 附加上服务器支持的版本列表 (QUIC_V2_VERSION, QUIC_V1_VERSION)
+    // 5. 追加服务端支持的版本列表（QUIC_V2_VERSION、QUIC_V1_VERSION）
     // 写入 v2
     out_buf[offset++] = (QUIC_V2_VERSION >> 24) & 0xFF;
     out_buf[offset++] = (QUIC_V2_VERSION >> 16) & 0xFF;
@@ -118,6 +115,5 @@ int quic_generate_version_negotiation(const quic_pkt_header_meta_t *in_meta, uin
     out_buf[offset++] = (QUIC_V1_VERSION >> 8) & 0xFF;
     out_buf[offset++] = QUIC_V1_VERSION & 0xFF;
 
-    printf("[DEBUG] Generated Version Negotiation Packet, length=%zu\n", offset);
     return offset;
 }
