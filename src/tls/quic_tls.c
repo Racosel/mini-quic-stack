@@ -4,6 +4,7 @@
 #include "quic_frame.h"
 #include "quic_initial.h"
 #include "quic_packet_protection.h"
+#include "quic_retry.h"
 #include "quic_varint.h"
 #include <openssl/err.h>
 #include <stdio.h>
@@ -17,11 +18,21 @@
 static const uint8_t quic_tls_alpn[] = { 0x07, 'a', 'i', '-', 'q', 'u', 'i', 'c' };
 
 typedef struct {
+    uint8_t kind;
     quic_pkt_header_meta_t meta;
+    uint8_t packet_type;
     quic_pn_space_id_t space;
     enum ssl_encryption_level_t level;
     size_t pn_offset;
+    size_t token_offset;
+    size_t token_length;
 } quic_tls_packet_header_t;
+
+enum {
+    QUIC_TLS_PACKET_STANDARD = 0,
+    QUIC_TLS_PACKET_VERSION_NEGOTIATION = 1,
+    QUIC_TLS_PACKET_RETRY = 2
+};
 
 static uint64_t quic_tls_now_ms(void) {
     struct timespec ts;
@@ -29,6 +40,8 @@ static uint64_t quic_tls_now_ms(void) {
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)(ts.tv_nsec / 1000000ULL);
 }
+
+static void quic_tls_arm_loss_timer(quic_tls_conn_t *conn);
 
 static int quic_tls_server_alpn_cb(SSL *ssl,
                                    const uint8_t **out,
@@ -96,6 +109,8 @@ static quic_pn_space_id_t quic_tls_space_from_level(enum ssl_encryption_level_t 
     switch (level) {
         case ssl_encryption_initial:
             return QUIC_PN_SPACE_INITIAL;
+        case ssl_encryption_early_data:
+            return QUIC_PN_SPACE_APPLICATION;
         case ssl_encryption_handshake:
             return QUIC_PN_SPACE_HANDSHAKE;
         case ssl_encryption_application:
@@ -107,8 +122,38 @@ static quic_pn_space_id_t quic_tls_space_from_level(enum ssl_encryption_level_t 
 
 static int quic_tls_is_supported_level(enum ssl_encryption_level_t level) {
     return level == ssl_encryption_initial ||
+           level == ssl_encryption_early_data ||
            level == ssl_encryption_handshake ||
            level == ssl_encryption_application;
+}
+
+static enum ssl_encryption_level_t quic_tls_ack_level_for_rx(enum ssl_encryption_level_t level) {
+    return level == ssl_encryption_early_data ? ssl_encryption_application : level;
+}
+
+static int quic_tls_server_amplification_limited(const quic_tls_conn_t *conn, size_t packet_len) {
+    uint64_t budget;
+
+    if (!conn || conn->role != QUIC_ROLE_SERVER || conn->peer_address_validated) {
+        return 0;
+    }
+
+    budget = conn->bytes_received * 3;
+    return conn->bytes_sent + packet_len > budget;
+}
+
+static void quic_tls_note_packet_sent(quic_tls_conn_t *conn, size_t packet_len) {
+    if (!conn) {
+        return;
+    }
+    conn->bytes_sent += packet_len;
+}
+
+static void quic_tls_note_packet_received(quic_tls_conn_t *conn, size_t packet_len) {
+    if (!conn) {
+        return;
+    }
+    conn->bytes_received += packet_len;
 }
 
 static int quic_tls_has_live_flight(const quic_tls_conn_t *conn) {
@@ -121,7 +166,8 @@ static int quic_tls_has_live_flight(const quic_tls_conn_t *conn) {
     if (conn->ping_pending ||
         conn->ping_in_flight ||
         conn->handshake_done_pending ||
-        conn->handshake_done_in_flight) {
+        conn->handshake_done_in_flight ||
+        conn->special_packet_pending) {
         return 1;
     }
 
@@ -140,8 +186,19 @@ static int quic_tls_level_has_sendable_output(const quic_tls_conn_t *conn, enum 
     if (!conn || space == QUIC_PN_SPACE_COUNT) {
         return 0;
     }
-    return quic_crypto_sendbuf_has_pending(&conn->levels[level].send) &&
+    return (quic_crypto_sendbuf_has_pending(&conn->levels[level].send) || conn->levels[level].ack_pending) &&
            conn->conn.spaces[space].tx_keys_ready;
+}
+
+static int quic_tls_queue_special_packet(quic_tls_conn_t *conn, const uint8_t *packet, size_t packet_len) {
+    if (!conn || !packet || packet_len == 0 || packet_len > sizeof(conn->special_packet)) {
+        return quic_tls_fail(conn, "invalid special packet");
+    }
+    memcpy(conn->special_packet, packet, packet_len);
+    conn->special_packet_len = packet_len;
+    conn->special_packet_pending = 1;
+    quic_tls_arm_loss_timer(conn);
+    return 0;
 }
 
 static void quic_tls_arm_loss_timer(quic_tls_conn_t *conn) {
@@ -185,6 +242,52 @@ static int quic_tls_update_peer_transport_params(quic_tls_conn_t *conn) {
     return 0;
 }
 
+static int quic_tls_build_retry_token(const quic_cid_t *original_dcid,
+                                      uint8_t *out,
+                                      size_t out_len,
+                                      size_t *written) {
+    if (!original_dcid || !out || !written || original_dcid->len == 0 || out_len < (size_t)(4 + original_dcid->len)) {
+        return -1;
+    }
+
+    out[0] = 'A';
+    out[1] = 'I';
+    out[2] = 'Q';
+    out[3] = original_dcid->len;
+    memcpy(out + 4, original_dcid->data, original_dcid->len);
+    *written = 4 + original_dcid->len;
+    return 0;
+}
+
+static int quic_tls_validate_retry_token(const uint8_t *token,
+                                         size_t token_len,
+                                         const quic_cid_t *original_dcid) {
+    if (!token || !original_dcid || token_len < 4) {
+        return 0;
+    }
+    if (token[0] != 'A' || token[1] != 'I' || token[2] != 'Q' || token[3] != original_dcid->len) {
+        return 0;
+    }
+    return token_len == (size_t)(4 + original_dcid->len) &&
+           memcmp(token + 4, original_dcid->data, original_dcid->len) == 0;
+}
+
+static void quic_tls_reset_initial_stream_state(quic_tls_conn_t *conn) {
+    if (!conn) {
+        return;
+    }
+
+    quic_conn_discard_space(&conn->conn, QUIC_PN_SPACE_INITIAL);
+    quic_crypto_recvbuf_free(&conn->levels[ssl_encryption_initial].recv);
+    quic_crypto_recvbuf_init(&conn->levels[ssl_encryption_initial].recv);
+    quic_crypto_sendbuf_restart_flight(&conn->levels[ssl_encryption_initial].send);
+    conn->levels[ssl_encryption_initial].discarded = 0;
+    conn->levels[ssl_encryption_initial].read_secret_ready = 0;
+    conn->levels[ssl_encryption_initial].write_secret_ready = 0;
+    conn->levels[ssl_encryption_initial].ack_pending = 0;
+    conn->initial_keys_discarded = 0;
+}
+
 static void quic_tls_maybe_discard_keys(quic_tls_conn_t *conn) {
     if (!conn) {
         return;
@@ -197,6 +300,7 @@ static void quic_tls_maybe_discard_keys(quic_tls_conn_t *conn) {
         conn->levels[ssl_encryption_initial].discarded = 1;
         conn->levels[ssl_encryption_initial].read_secret_ready = 0;
         conn->levels[ssl_encryption_initial].write_secret_ready = 0;
+        conn->levels[ssl_encryption_initial].ack_pending = 0;
         conn->initial_keys_discarded = 1;
     }
 
@@ -210,6 +314,7 @@ static void quic_tls_maybe_discard_keys(quic_tls_conn_t *conn) {
         conn->levels[ssl_encryption_handshake].discarded = 1;
         conn->levels[ssl_encryption_handshake].read_secret_ready = 0;
         conn->levels[ssl_encryption_handshake].write_secret_ready = 0;
+        conn->levels[ssl_encryption_handshake].ack_pending = 0;
         conn->handshake_keys_discarded = 1;
     }
 }
@@ -271,7 +376,7 @@ static int quic_tls_set_transport_params(quic_tls_conn_t *conn) {
 static int quic_tls_install_initial_keys(quic_tls_conn_t *conn) {
     quic_crypto_context_t initial;
 
-    if (!conn || !conn->version_ops || !conn->original_dcid_known) {
+    if (!conn || !conn->version_ops || !conn->initial_dcid_known) {
         return quic_tls_fail(conn, "initial key prerequisites missing");
     }
     if (conn->levels[ssl_encryption_initial].read_secret_ready &&
@@ -279,13 +384,13 @@ static int quic_tls_install_initial_keys(quic_tls_conn_t *conn) {
         return 0;
     }
 
-    if (quic_crypto_setup_initial_keys(&conn->original_dcid, conn->version_ops, &initial) != 0) {
+    if (quic_crypto_setup_initial_keys(&conn->initial_dcid, conn->version_ops, &initial) != 0) {
         return quic_tls_fail(conn, "failed to derive initial keys");
     }
 
     conn->conn.version = conn->version;
     conn->conn.version_ops = conn->version_ops;
-    conn->conn.original_dcid = conn->original_dcid;
+    conn->conn.original_dcid = conn->initial_dcid;
     conn->conn.state = QUIC_CONN_STATE_HANDSHAKING;
 
     if (conn->role == QUIC_ROLE_CLIENT) {
@@ -483,14 +588,34 @@ static int quic_tls_feed_crypto(quic_tls_conn_t *conn, enum ssl_encryption_level
     return 0;
 }
 
+static void quic_tls_mark_ack_pending(quic_tls_conn_t *conn, enum ssl_encryption_level_t received_level) {
+    enum ssl_encryption_level_t ack_level;
+
+    if (!conn) {
+        return;
+    }
+
+    ack_level = quic_tls_ack_level_for_rx(received_level);
+    if (!quic_tls_is_supported_level(ack_level)) {
+        return;
+    }
+    conn->levels[ack_level].ack_pending = 1;
+}
+
 static int quic_tls_parse_frames(quic_tls_conn_t *conn,
                                  enum ssl_encryption_level_t level,
                                  const uint8_t *plaintext,
                                  size_t plaintext_len,
-                                 int *fed_crypto) {
+                                 int *fed_crypto,
+                                 int *saw_ack_eliciting) {
     size_t offset = 0;
 
+    if (!conn || !plaintext || !fed_crypto || !saw_ack_eliciting) {
+        return quic_tls_fail(conn, "invalid frame parsing arguments");
+    }
+
     while (offset < plaintext_len) {
+        size_t frame_start = offset;
         uint64_t frame_type;
 
         if (quic_decode_varint(plaintext, plaintext_len, &offset, &frame_type) != 0) {
@@ -506,11 +631,30 @@ static int quic_tls_parse_frames(quic_tls_conn_t *conn,
 
             case QUIC_FRAME_PING:
                 conn->ping_received = 1;
+                *saw_ack_eliciting = 1;
                 break;
 
             case QUIC_FRAME_HANDSHAKE_DONE:
                 conn->handshake_done_received = 1;
+                *saw_ack_eliciting = 1;
                 break;
+
+            case QUIC_FRAME_ACK:
+            case QUIC_FRAME_ACK_ECN: {
+                quic_ack_frame_t ack;
+                size_t consumed = 0;
+
+                if (quic_ack_parse_frame(plaintext + frame_start, plaintext_len - frame_start, &ack, &consumed) != 0) {
+                    return quic_tls_fail(conn, "invalid ack frame");
+                }
+                if (quic_on_ack_frame(&conn->conn.spaces[quic_tls_space_from_level(level)].in_flight,
+                                      &ack,
+                                      &conn->conn.last_acked_packets) != 0) {
+                    return quic_tls_fail(conn, "failed to apply ack frame");
+                }
+                offset = frame_start + consumed;
+                break;
+            }
 
             case QUIC_FRAME_CRYPTO: {
                 uint64_t crypto_offset;
@@ -529,14 +673,29 @@ static int quic_tls_parse_frames(quic_tls_conn_t *conn,
                     return quic_tls_fail(conn, "failed to reassemble crypto data");
                 }
                 offset += (size_t)crypto_len;
+                *saw_ack_eliciting = 1;
                 if (quic_tls_feed_crypto(conn, level, fed_crypto) != 0) {
                     return -1;
                 }
                 break;
             }
 
+            case QUIC_FRAME_NEW_TOKEN: {
+                uint64_t token_len;
+                if (quic_decode_varint(plaintext, plaintext_len, &offset, &token_len) != 0 ||
+                    token_len > plaintext_len - offset ||
+                    token_len > sizeof(conn->retry_token)) {
+                    return quic_tls_fail(conn, "invalid new_token frame");
+                }
+                memcpy(conn->retry_token, plaintext + offset, (size_t)token_len);
+                conn->retry_token_len = (size_t)token_len;
+                offset += (size_t)token_len;
+                *saw_ack_eliciting = 1;
+                break;
+            }
+
             default:
-                return quic_tls_fail(conn, "received unsupported frame during stage 1");
+                return quic_tls_fail(conn, "received unsupported frame during stage 2");
         }
     }
 
@@ -548,21 +707,29 @@ static int quic_tls_encode_long_header(uint8_t packet_type,
                                        const quic_cid_t *scid,
                                        uint32_t version,
                                        uint64_t length,
-                                       int include_token,
+                                       const uint8_t *token,
+                                       size_t token_len,
                                        size_t pn_len,
                                        uint64_t packet_number,
                                        uint8_t *out,
                                        size_t out_len,
                                        size_t *pn_offset,
                                        size_t *header_len) {
+    const quic_version_ops_t *ops;
     size_t offset = 0;
     int rc;
+    uint8_t encoded_type;
 
     if (!dcid || !scid || !out || !pn_offset || !header_len || pn_len != 4) {
         return -1;
     }
+    ops = quic_version_get_ops(version);
+    if (!ops || !ops->encode_packet_type) {
+        return -1;
+    }
+    encoded_type = ops->encode_packet_type(packet_type);
 
-    out[offset++] = (uint8_t)(0xc0 | ((packet_type & 0x03) << 4) | ((pn_len - 1) & 0x03));
+    out[offset++] = (uint8_t)(0xc0 | ((encoded_type & 0x03) << 4) | ((pn_len - 1) & 0x03));
     out[offset++] = (uint8_t)(version >> 24);
     out[offset++] = (uint8_t)(version >> 16);
     out[offset++] = (uint8_t)(version >> 8);
@@ -578,12 +745,19 @@ static int quic_tls_encode_long_header(uint8_t packet_type,
     memcpy(out + offset, scid->data, scid->len);
     offset += scid->len;
 
-    if (include_token) {
-        rc = quic_encode_varint(0, out + offset, out_len - offset);
+    if (packet_type == 0) {
+        rc = quic_encode_varint(token_len, out + offset, out_len - offset);
         if (rc < 0) {
             return -1;
         }
         offset += (size_t)rc;
+        if (offset + token_len > out_len) {
+            return -1;
+        }
+        if (token_len > 0 && token) {
+            memcpy(out + offset, token, token_len);
+        }
+        offset += token_len;
     }
 
     rc = quic_encode_varint(length, out + offset, out_len - offset);
@@ -630,25 +804,37 @@ static int quic_tls_encode_short_header(const quic_cid_t *dcid,
     return 0;
 }
 
-static int quic_tls_parse_handshake_header(const uint8_t *packet, size_t packet_len, size_t *pn_offset) {
-    quic_pkt_header_meta_t meta;
-    const quic_version_ops_t *ops;
+static int quic_tls_parse_long_header_pn_offset(quic_tls_packet_header_t *header,
+                                                const uint8_t *packet,
+                                                size_t packet_len,
+                                                uint8_t logical_packet_type) {
     size_t offset;
     uint64_t ignored_length;
+    uint64_t token_length = 0;
 
-    if (!packet || !pn_offset) {
+    if (!header || !packet) {
         return -1;
     }
-    if (quic_parse_header_meta(packet, packet_len, &meta) != 0 || meta.header_form != 1) {
-        return -1;
-    }
-
-    ops = quic_version_get_ops(meta.version);
-    if (!ops || ops->decode_packet_type(packet[0]) != 2) {
+    offset = 6 + header->meta.dest_cid.len + 1 + header->meta.src_cid.len;
+    if (offset > packet_len) {
         return -1;
     }
 
-    offset = 6 + meta.dest_cid.len + 1 + meta.src_cid.len;
+    header->token_offset = 0;
+    header->token_length = 0;
+
+    if (logical_packet_type == 0) {
+        if (quic_decode_varint(packet, packet_len, &offset, &token_length) != 0) {
+            return -1;
+        }
+        if (offset + token_length > packet_len) {
+            return -1;
+        }
+        header->token_offset = offset;
+        header->token_length = (size_t)token_length;
+        offset += (size_t)token_length;
+    }
+
     if (quic_decode_varint(packet, packet_len, &offset, &ignored_length) != 0) {
         return -1;
     }
@@ -656,7 +842,7 @@ static int quic_tls_parse_handshake_header(const uint8_t *packet, size_t packet_
         return -1;
     }
 
-    *pn_offset = offset;
+    header->pn_offset = offset;
     return 0;
 }
 
@@ -673,6 +859,10 @@ static int quic_tls_classify_packet(quic_tls_conn_t *conn,
     if (quic_parse_header_meta(packet, packet_len, &header->meta) != 0) {
         return quic_tls_fail(conn, "failed to parse packet header");
     }
+    header->kind = QUIC_TLS_PACKET_STANDARD;
+    header->packet_type = 0xff;
+    header->token_offset = 0;
+    header->token_length = 0;
 
     if (header->meta.header_form == 0) {
         if (conn->local_cid.len == 0 ||
@@ -685,31 +875,51 @@ static int quic_tls_classify_packet(quic_tls_conn_t *conn,
         return 0;
     }
 
+    if (header->meta.version == 0) {
+        header->kind = QUIC_TLS_PACKET_VERSION_NEGOTIATION;
+        return 0;
+    }
+
     ops = quic_version_get_ops(header->meta.version);
     if (!ops) {
         return quic_tls_fail(conn, "unsupported quic version");
     }
     packet_type = ops->decode_packet_type(packet[0]);
-    if (packet_type == 0) {
-        quic_initial_header_t initial;
-        if (quic_parse_initial_header(packet, packet_len, &initial) != 0) {
-            return quic_tls_fail(conn, "failed to parse initial header");
-        }
-        header->space = QUIC_PN_SPACE_INITIAL;
-        header->level = ssl_encryption_initial;
-        header->pn_offset = initial.pn_offset;
-        return 0;
-    }
-    if (packet_type == 2) {
-        if (quic_tls_parse_handshake_header(packet, packet_len, &header->pn_offset) != 0) {
-            return quic_tls_fail(conn, "failed to parse handshake header");
-        }
-        header->space = QUIC_PN_SPACE_HANDSHAKE;
-        header->level = ssl_encryption_handshake;
-        return 0;
-    }
+    header->packet_type = packet_type;
 
-    return quic_tls_fail(conn, "unsupported packet type for stage 1");
+    switch (packet_type) {
+        case 0:
+            if (quic_tls_parse_long_header_pn_offset(header, packet, packet_len, packet_type) != 0) {
+                return quic_tls_fail(conn, "failed to parse initial header");
+            }
+            header->space = QUIC_PN_SPACE_INITIAL;
+            header->level = ssl_encryption_initial;
+            return 0;
+        case 1:
+            if (quic_tls_parse_long_header_pn_offset(header, packet, packet_len, packet_type) != 0) {
+                return quic_tls_fail(conn, "failed to parse 0-rtt header");
+            }
+            header->space = QUIC_PN_SPACE_APPLICATION;
+            header->level = ssl_encryption_early_data;
+            return 0;
+        case 2:
+            if (quic_tls_parse_long_header_pn_offset(header, packet, packet_len, packet_type) != 0) {
+                return quic_tls_fail(conn, "failed to parse handshake header");
+            }
+            header->space = QUIC_PN_SPACE_HANDSHAKE;
+            header->level = ssl_encryption_handshake;
+            return 0;
+        case 3:
+            if (packet_len < (size_t)(6 + header->meta.dest_cid.len + 1 + header->meta.src_cid.len + QUIC_RETRY_INTEGRITY_TAG_LEN)) {
+                return quic_tls_fail(conn, "retry packet is truncated");
+            }
+            header->kind = QUIC_TLS_PACKET_RETRY;
+            header->token_offset = 6 + header->meta.dest_cid.len + 1 + header->meta.src_cid.len;
+            header->token_length = packet_len - header->token_offset - QUIC_RETRY_INTEGRITY_TAG_LEN;
+            return 0;
+        default:
+            return quic_tls_fail(conn, "unsupported packet type");
+    }
 }
 
 static int quic_tls_prepare_plan(quic_tls_conn_t *conn,
@@ -733,25 +943,68 @@ static int quic_tls_prepare_plan(quic_tls_conn_t *conn,
     return 0;
 }
 
-static int quic_tls_build_crypto_payload(quic_tls_conn_t *conn,
-                                         enum ssl_encryption_level_t level,
-                                         uint8_t *plaintext,
-                                         size_t plaintext_cap,
-                                         size_t *plaintext_len,
-                                         size_t *crypto_data_len) {
+static int quic_tls_append_ack_frame(quic_tls_conn_t *conn,
+                                     enum ssl_encryption_level_t level,
+                                     uint8_t *plaintext,
+                                     size_t plaintext_cap,
+                                     size_t *plaintext_len,
+                                     int *included_ack) {
+    quic_ack_frame_t ack;
+    quic_pn_space_id_t space;
+    size_t written = 0;
+
+    if (!conn || !plaintext || !plaintext_len || !included_ack) {
+        return quic_tls_fail(conn, "invalid ack frame arguments");
+    }
+
+    *included_ack = 0;
+    if (!conn->levels[level].ack_pending) {
+        return 0;
+    }
+
+    space = quic_tls_space_from_level(level);
+    if (space == QUIC_PN_SPACE_COUNT) {
+        return quic_tls_fail(conn, "invalid ack level");
+    }
+
+    memset(&ack, 0, sizeof(ack));
+    ack.largest_acked = conn->conn.spaces[space].largest_received_packet;
+    ack.ack_range_count = 1;
+    ack.ranges[0].largest = ack.largest_acked;
+    ack.ranges[0].smallest = 0;
+
+    if (quic_ack_encode_frame(&ack, plaintext + *plaintext_len, plaintext_cap - *plaintext_len, &written) != 0) {
+        return quic_tls_fail(conn, "failed to encode ack frame");
+    }
+
+    *plaintext_len += written;
+    *included_ack = 1;
+    return 0;
+}
+
+static int quic_tls_append_crypto_frame(quic_tls_conn_t *conn,
+                                        enum ssl_encryption_level_t level,
+                                        uint8_t *plaintext,
+                                        size_t plaintext_cap,
+                                        size_t *plaintext_len,
+                                        size_t *crypto_data_len) {
     quic_crypto_sendbuf_t *send = &conn->levels[level].send;
     size_t available = send->flight_end - send->send_offset;
     size_t chunk = available > QUIC_TLS_MAX_CRYPTO_CHUNK ? QUIC_TLS_MAX_CRYPTO_CHUNK : available;
     int rc;
     size_t frame_header_len;
 
-    if (!plaintext || !plaintext_len || !crypto_data_len || available == 0) {
-        return quic_tls_fail(conn, "no crypto data available");
+    if (!plaintext || !plaintext_len || !crypto_data_len) {
+        return quic_tls_fail(conn, "invalid crypto payload arguments");
+    }
+    if (available == 0) {
+        *crypto_data_len = 0;
+        return 0;
     }
 
     while (chunk > 0) {
         frame_header_len = 1 + quic_tls_varint_len(send->send_offset) + quic_tls_varint_len(chunk);
-        if (frame_header_len + chunk <= plaintext_cap) {
+        if (*plaintext_len + frame_header_len + chunk <= plaintext_cap) {
             break;
         }
         chunk--;
@@ -760,8 +1013,7 @@ static int quic_tls_build_crypto_payload(quic_tls_conn_t *conn,
         return quic_tls_fail(conn, "crypto frame does not fit into packet");
     }
 
-    plaintext[0] = QUIC_FRAME_CRYPTO;
-    *plaintext_len = 1;
+    plaintext[(*plaintext_len)++] = QUIC_FRAME_CRYPTO;
 
     rc = quic_encode_varint(send->send_offset, plaintext + *plaintext_len, plaintext_cap - *plaintext_len);
     if (rc < 0) {
@@ -781,40 +1033,50 @@ static int quic_tls_build_crypto_payload(quic_tls_conn_t *conn,
     return 0;
 }
 
-static int quic_tls_build_application_payload(quic_tls_conn_t *conn,
-                                              uint8_t *plaintext,
-                                              size_t plaintext_cap,
-                                              size_t *plaintext_len,
-                                              size_t *crypto_data_len,
-                                              int *includes_handshake_done,
-                                              int *includes_ping) {
+static int quic_tls_build_payload_for_level(quic_tls_conn_t *conn,
+                                            enum ssl_encryption_level_t level,
+                                            uint8_t *plaintext,
+                                            size_t plaintext_cap,
+                                            size_t *plaintext_len,
+                                            size_t *crypto_data_len,
+                                            int *includes_ack,
+                                            int *includes_handshake_done,
+                                            int *includes_ping,
+                                            int *ack_eliciting) {
     size_t offset = 0;
 
-    if (!conn || !plaintext || !plaintext_len || !crypto_data_len || !includes_handshake_done || !includes_ping) {
-        return quic_tls_fail(conn, "invalid application payload arguments");
+    if (!conn || !plaintext || !plaintext_len || !crypto_data_len || !includes_ack ||
+        !includes_handshake_done || !includes_ping || !ack_eliciting) {
+        return quic_tls_fail(conn, "invalid payload arguments");
     }
 
     *crypto_data_len = 0;
+    *includes_ack = 0;
     *includes_handshake_done = 0;
     *includes_ping = 0;
+    *ack_eliciting = 0;
 
-    if (quic_crypto_sendbuf_has_pending(&conn->levels[ssl_encryption_application].send)) {
-        if (quic_tls_build_crypto_payload(conn,
-                                          ssl_encryption_application,
-                                          plaintext,
-                                          plaintext_cap,
-                                          &offset,
-                                          crypto_data_len) != 0) {
+    if (quic_tls_append_ack_frame(conn, level, plaintext, plaintext_cap, &offset, includes_ack) != 0) {
+        return -1;
+    }
+
+    if (level != ssl_encryption_early_data &&
+        quic_crypto_sendbuf_has_pending(&conn->levels[level].send)) {
+        if (quic_tls_append_crypto_frame(conn, level, plaintext, plaintext_cap, &offset, crypto_data_len) != 0) {
             return -1;
+        }
+        if (*crypto_data_len > 0) {
+            *ack_eliciting = 1;
         }
     }
 
-    if (conn->handshake_done_pending) {
+    if (level == ssl_encryption_application && conn->handshake_done_pending) {
         if (offset + 1 > plaintext_cap) {
             return quic_tls_fail(conn, "handshake_done does not fit");
         }
         plaintext[offset++] = QUIC_FRAME_HANDSHAKE_DONE;
         *includes_handshake_done = 1;
+        *ack_eliciting = 1;
     }
 
     if (conn->ping_pending) {
@@ -823,10 +1085,11 @@ static int quic_tls_build_application_payload(quic_tls_conn_t *conn,
         }
         plaintext[offset++] = QUIC_FRAME_PING;
         *includes_ping = 1;
+        *ack_eliciting = 1;
     }
 
     if (offset == 0) {
-        return quic_tls_fail(conn, "no application payload queued");
+        return quic_tls_fail(conn, "no payload queued");
     }
 
     *plaintext_len = offset;
@@ -850,27 +1113,36 @@ static int quic_tls_build_datagram_for_level(quic_tls_conn_t *conn,
     uint64_t length_field;
     size_t target_total_len = 0;
     quic_crypto_level_ctx_t *tx_ctx;
+    int includes_ack = 0;
     int includes_handshake_done = 0;
     int includes_ping = 0;
+    int ack_eliciting = 0;
+    const uint8_t *initial_token = NULL;
+    size_t initial_token_len = 0;
+    uint8_t logical_packet_type;
 
     if (!conn || !out || !written || space == QUIC_PN_SPACE_COUNT) {
         return quic_tls_fail(conn, "invalid datagram build arguments");
     }
 
-    if (quic_tls_prepare_plan(conn, space, 1, &plan) != 0) {
+    if (quic_tls_build_payload_for_level(conn,
+                                         level,
+                                         plaintext,
+                                         sizeof(plaintext),
+                                         &plaintext_len,
+                                         &crypto_data_len,
+                                         &includes_ack,
+                                         &includes_handshake_done,
+                                         &includes_ping,
+                                         &ack_eliciting) != 0) {
+        return -1;
+    }
+
+    if (quic_tls_prepare_plan(conn, space, ack_eliciting ? 1 : 0, &plan) != 0) {
         return -1;
     }
 
     if (level == ssl_encryption_application) {
-        if (quic_tls_build_application_payload(conn,
-                                               plaintext,
-                                               sizeof(plaintext),
-                                               &plaintext_len,
-                                               &crypto_data_len,
-                                               &includes_handshake_done,
-                                               &includes_ping) != 0) {
-            return -1;
-        }
         if (quic_tls_encode_short_header(&conn->peer_cid,
                                          plan.packet_number_len,
                                          plan.packet_number,
@@ -881,24 +1153,19 @@ static int quic_tls_build_datagram_for_level(quic_tls_conn_t *conn,
             return quic_tls_fail(conn, "failed to encode short header");
         }
     } else {
-        if (quic_tls_build_crypto_payload(conn,
-                                          level,
-                                          plaintext,
-                                          sizeof(plaintext),
-                                          &plaintext_len,
-                                          &crypto_data_len) != 0) {
-            return -1;
-        }
-
         target_total_len = 0;
+        if (level == ssl_encryption_initial) {
+            initial_token = conn->retry_token_len > 0 ? conn->retry_token : NULL;
+            initial_token_len = conn->retry_token_len;
+        }
         if (level == ssl_encryption_initial && conn->role == QUIC_ROLE_CLIENT && plan.packet_number == 0) {
             target_total_len = 1200;
         }
 
         for (;;) {
-            size_t token_varint_len = 1;
+            size_t token_varint_len = level == ssl_encryption_initial ? quic_tls_varint_len(initial_token_len) : 0;
             size_t fixed_header_len = 1 + 4 + 1 + conn->peer_cid.len + 1 + conn->local_cid.len +
-                                      (level == ssl_encryption_initial ? token_varint_len : 0) +
+                                      (level == ssl_encryption_initial ? token_varint_len + initial_token_len : 0) +
                                       quic_tls_varint_len(plan.packet_number_len + plaintext_len + QUIC_AEAD_TAG_LEN) +
                                       plan.packet_number_len;
             size_t total_len = fixed_header_len + plaintext_len + QUIC_AEAD_TAG_LEN;
@@ -912,13 +1179,16 @@ static int quic_tls_build_datagram_for_level(quic_tls_conn_t *conn,
             plaintext[plaintext_len++] = QUIC_FRAME_PADDING;
         }
 
+        logical_packet_type = level == ssl_encryption_initial ? 0 :
+                              (level == ssl_encryption_early_data ? 1 : 2);
         length_field = plan.packet_number_len + plaintext_len + QUIC_AEAD_TAG_LEN;
-        if (quic_tls_encode_long_header(level == ssl_encryption_initial ? 0 : 2,
+        if (quic_tls_encode_long_header(logical_packet_type,
                                         &conn->peer_cid,
                                         &conn->local_cid,
                                         conn->version,
                                         length_field,
-                                        level == ssl_encryption_initial,
+                                        initial_token,
+                                        initial_token_len,
                                         plan.packet_number_len,
                                         plan.packet_number,
                                         header,
@@ -943,10 +1213,17 @@ static int quic_tls_build_datagram_for_level(quic_tls_conn_t *conn,
         return quic_tls_fail(conn, "failed to protect packet");
     }
 
-    if (level == ssl_encryption_application) {
-        if (crypto_data_len > 0) {
-            quic_crypto_sendbuf_advance(&conn->levels[level].send, crypto_data_len);
-        }
+    if (quic_tls_server_amplification_limited(conn, packet_len)) {
+        return quic_tls_fail(conn, "server amplification limit reached");
+    }
+
+    if (crypto_data_len > 0) {
+        quic_crypto_sendbuf_advance(&conn->levels[level].send, crypto_data_len);
+    }
+    if (includes_ack) {
+        conn->levels[level].ack_pending = 0;
+    }
+    if (level == ssl_encryption_application || level == ssl_encryption_early_data) {
         if (includes_handshake_done) {
             conn->handshake_done_pending = 0;
             conn->handshake_done_in_flight = 1;
@@ -955,11 +1232,14 @@ static int quic_tls_build_datagram_for_level(quic_tls_conn_t *conn,
             conn->ping_pending = 0;
             conn->ping_in_flight = 1;
         }
-    } else {
-        quic_crypto_sendbuf_advance(&conn->levels[level].send, crypto_data_len);
+    }
+
+    if (ack_eliciting) {
+        quic_on_packet_sent(&conn->conn.spaces[space].in_flight, plan.packet_number, packet_len, 1);
     }
 
     *written = packet_len;
+    quic_tls_note_packet_sent(conn, packet_len);
     quic_tls_arm_loss_timer(conn);
     return 0;
 }
@@ -998,6 +1278,9 @@ void quic_tls_conn_free(quic_tls_conn_t *conn) {
     for (i = 0; i <= ssl_encryption_application; i++) {
         quic_crypto_recvbuf_free(&conn->levels[i].recv);
         quic_crypto_sendbuf_free(&conn->levels[i].send);
+    }
+    for (i = 0; i < QUIC_PN_SPACE_COUNT; i++) {
+        quic_queue_clear(&conn->conn.spaces[i].in_flight);
     }
 }
 
@@ -1053,6 +1336,8 @@ int quic_tls_conn_configure(quic_tls_conn_t *conn,
     if (!conn->ssl) {
         return quic_tls_fail_ssl(conn, "failed to create ssl object");
     }
+    SSL_CTX_set_early_data_enabled(conn->ssl_ctx, 1);
+    SSL_set_early_data_enabled(conn->ssl, 1);
     if (SSL_set_quic_method(conn->ssl, &quic_tls_quic_method) != 1) {
         return quic_tls_fail_ssl(conn, "failed to install quic method");
     }
@@ -1069,6 +1354,9 @@ int quic_tls_conn_configure(quic_tls_conn_t *conn,
         }
         conn->original_dcid = *peer_cid;
         conn->original_dcid_known = 1;
+        conn->initial_dcid = *peer_cid;
+        conn->initial_dcid_known = 1;
+        conn->peer_address_validated = 1;
         if (quic_tls_install_initial_keys(conn) != 0) {
             return -1;
         }
@@ -1082,6 +1370,153 @@ int quic_tls_conn_configure(quic_tls_conn_t *conn,
     return 0;
 }
 
+static int quic_tls_build_version_negotiation_packet(quic_tls_conn_t *conn,
+                                                     const quic_pkt_header_meta_t *meta) {
+    uint8_t packet[QUIC_TLS_MAX_DATAGRAM_SIZE];
+    int packet_len;
+
+    if (!conn || !meta) {
+        return quic_tls_fail(conn, "invalid version negotiation arguments");
+    }
+
+    packet_len = quic_generate_version_negotiation(meta, packet, sizeof(packet));
+    if (packet_len < 0) {
+        return quic_tls_fail(conn, "failed to generate version negotiation packet");
+    }
+    return quic_tls_queue_special_packet(conn, packet, (size_t)packet_len);
+}
+
+static int quic_tls_build_retry_packet(quic_tls_conn_t *conn, const quic_pkt_header_meta_t *meta) {
+    uint8_t packet[QUIC_TLS_MAX_DATAGRAM_SIZE];
+    uint8_t token[QUIC_TLS_MAX_RETRY_TOKEN];
+    uint8_t tag[QUIC_RETRY_INTEGRITY_TAG_LEN];
+    uint8_t encoded_type;
+    size_t token_len = 0;
+    size_t offset = 0;
+
+    if (!conn || !meta || !conn->version_ops || !conn->version_ops->encode_packet_type) {
+        return quic_tls_fail(conn, "invalid retry build arguments");
+    }
+    if (quic_tls_build_retry_token(&conn->original_dcid, token, sizeof(token), &token_len) != 0) {
+        return quic_tls_fail(conn, "failed to build retry token");
+    }
+
+    encoded_type = conn->version_ops->encode_packet_type(3);
+    packet[offset++] = (uint8_t)(0xf0 | ((encoded_type & 0x03) << 4));
+    packet[offset++] = (uint8_t)(conn->version >> 24);
+    packet[offset++] = (uint8_t)(conn->version >> 16);
+    packet[offset++] = (uint8_t)(conn->version >> 8);
+    packet[offset++] = (uint8_t)conn->version;
+    packet[offset++] = meta->src_cid.len;
+    memcpy(packet + offset, meta->src_cid.data, meta->src_cid.len);
+    offset += meta->src_cid.len;
+    packet[offset++] = conn->local_cid.len;
+    memcpy(packet + offset, conn->local_cid.data, conn->local_cid.len);
+    offset += conn->local_cid.len;
+    memcpy(packet + offset, token, token_len);
+    offset += token_len;
+
+    if (quic_retry_compute_integrity_tag(conn->version, &conn->original_dcid, packet, offset, tag) != 0) {
+        return quic_tls_fail(conn, "failed to compute retry integrity tag");
+    }
+    memcpy(packet + offset, tag, sizeof(tag));
+    offset += sizeof(tag);
+
+    return quic_tls_queue_special_packet(conn, packet, offset);
+}
+
+static int quic_tls_client_handle_retry(quic_tls_conn_t *conn,
+                                        const quic_tls_packet_header_t *header,
+                                        const uint8_t *packet,
+                                        size_t packet_len) {
+    if (!conn || !header || !packet) {
+        return quic_tls_fail(conn, "invalid retry handling arguments");
+    }
+    if (conn->role != QUIC_ROLE_CLIENT) {
+        return 0;
+    }
+    if (conn->retry_processed) {
+        return quic_tls_fail(conn, "duplicate retry received");
+    }
+    if (quic_retry_verify_integrity_tag(conn->version, &conn->original_dcid, packet, packet_len) != 0) {
+        return quic_tls_fail(conn, "retry integrity verification failed");
+    }
+    if (header->token_length > sizeof(conn->retry_token)) {
+        return quic_tls_fail(conn, "retry token too large");
+    }
+
+    memcpy(conn->retry_token, packet + header->token_offset, header->token_length);
+    conn->retry_token_len = header->token_length;
+    conn->peer_cid = header->meta.src_cid;
+    conn->peer_cid_known = 1;
+    conn->initial_dcid = header->meta.src_cid;
+    conn->initial_dcid_known = 1;
+    conn->retry_processed = 1;
+    quic_tls_reset_initial_stream_state(conn);
+    if (quic_tls_install_initial_keys(conn) != 0) {
+        return -1;
+    }
+    return 0;
+}
+
+static int quic_tls_server_prepare_initial_context(quic_tls_conn_t *conn,
+                                                   const quic_tls_packet_header_t *header) {
+    if (!conn || !header) {
+        return quic_tls_fail(conn, "invalid initial context arguments");
+    }
+
+    conn->peer_cid = header->meta.src_cid;
+    conn->peer_cid_known = 1;
+
+    if (!conn->original_dcid_known) {
+        conn->original_dcid = header->meta.dest_cid;
+        conn->original_dcid_known = 1;
+    }
+
+    if (!conn->initial_dcid_known) {
+        quic_tls_reset_initial_stream_state(conn);
+        conn->initial_dcid = header->meta.dest_cid;
+        conn->initial_dcid_known = 1;
+    }
+
+    if (quic_tls_install_initial_keys(conn) != 0) {
+        return -1;
+    }
+    if (!conn->transport_params_set && quic_tls_set_transport_params(conn) != 0) {
+        return -1;
+    }
+    return 0;
+}
+
+static int quic_tls_server_maybe_require_retry(quic_tls_conn_t *conn,
+                                               const quic_tls_packet_header_t *header,
+                                               const uint8_t *packet) {
+    const uint8_t *token;
+
+    if (!conn || !header || conn->role != QUIC_ROLE_SERVER || !conn->retry_required || header->packet_type != 0) {
+        return 0;
+    }
+
+    token = header->token_length > 0 ? packet + header->token_offset : NULL;
+    if (header->token_length > 0 &&
+        conn->original_dcid_known &&
+        quic_tls_validate_retry_token(token, header->token_length, &conn->original_dcid)) {
+        conn->peer_address_validated = 1;
+        return 0;
+    }
+
+    if (!conn->original_dcid_known) {
+        conn->original_dcid = header->meta.dest_cid;
+        conn->original_dcid_known = 1;
+    }
+    conn->peer_cid = header->meta.src_cid;
+    conn->peer_cid_known = 1;
+    if (quic_tls_build_retry_packet(conn, &header->meta) != 0) {
+        return -1;
+    }
+    return 1;
+}
+
 int quic_tls_conn_start(quic_tls_conn_t *conn) {
     if (!conn || conn->role != QUIC_ROLE_CLIENT) {
         return quic_tls_fail(conn, "only client may start handshake proactively");
@@ -1090,6 +1525,7 @@ int quic_tls_conn_start(quic_tls_conn_t *conn) {
 }
 
 int quic_tls_conn_handle_datagram(quic_tls_conn_t *conn, const uint8_t *packet, size_t packet_len) {
+    quic_pkt_header_meta_t meta;
     quic_tls_packet_header_t header;
     uint8_t packet_copy[QUIC_TLS_MAX_DATAGRAM_SIZE];
     uint8_t plaintext[QUIC_TLS_MAX_DATAGRAM_SIZE];
@@ -1098,9 +1534,21 @@ int quic_tls_conn_handle_datagram(quic_tls_conn_t *conn, const uint8_t *packet, 
     uint64_t packet_number;
     quic_conn_pn_space_t *space;
     int fed_crypto = 0;
+    int saw_ack_eliciting = 0;
 
     if (!conn || !packet || packet_len == 0 || packet_len > sizeof(packet_copy)) {
         return quic_tls_fail(conn, "invalid datagram input");
+    }
+    if (quic_parse_header_meta(packet, packet_len, &meta) != 0) {
+        return quic_tls_fail(conn, "failed to parse datagram header");
+    }
+    quic_tls_note_packet_received(conn, packet_len);
+
+    if (meta.header_form == 1 && meta.version != 0 && quic_version_get_ops(meta.version) == NULL) {
+        if (conn->role == QUIC_ROLE_SERVER) {
+            return quic_tls_build_version_negotiation_packet(conn, &meta);
+        }
+        return quic_tls_fail(conn, "peer sent unsupported quic version");
     }
 
     memcpy(packet_copy, packet, packet_len);
@@ -1108,16 +1556,30 @@ int quic_tls_conn_handle_datagram(quic_tls_conn_t *conn, const uint8_t *packet, 
         return -1;
     }
 
+    if (header.kind == QUIC_TLS_PACKET_VERSION_NEGOTIATION) {
+        if (conn->role == QUIC_ROLE_CLIENT) {
+            conn->received_version_negotiation = 1;
+            conn->conn.state = QUIC_CONN_STATE_CLOSED;
+            return 0;
+        }
+        return quic_tls_fail(conn, "unexpected version negotiation packet");
+    }
+
+    if (header.kind == QUIC_TLS_PACKET_RETRY) {
+        return quic_tls_client_handle_retry(conn, &header, packet, packet_len);
+    }
+
     if (header.meta.header_form == 1) {
-        if (conn->role == QUIC_ROLE_SERVER && !conn->original_dcid_known && header.space == QUIC_PN_SPACE_INITIAL) {
-            conn->original_dcid = header.meta.dest_cid;
-            conn->original_dcid_known = 1;
-            conn->peer_cid = header.meta.src_cid;
-            conn->peer_cid_known = 1;
-            if (quic_tls_install_initial_keys(conn) != 0) {
+        if (conn->role == QUIC_ROLE_SERVER && header.space == QUIC_PN_SPACE_INITIAL) {
+            int retry_status = quic_tls_server_maybe_require_retry(conn, &header, packet);
+
+            if (retry_status < 0) {
                 return -1;
             }
-            if (!conn->transport_params_set && quic_tls_set_transport_params(conn) != 0) {
+            if (retry_status > 0) {
+                return 0;
+            }
+            if (quic_tls_server_prepare_initial_context(conn, &header) != 0) {
                 return -1;
             }
         } else if (conn->role == QUIC_ROLE_CLIENT && header.meta.src_cid.len > 0) {
@@ -1161,13 +1623,24 @@ int quic_tls_conn_handle_datagram(quic_tls_conn_t *conn, const uint8_t *packet, 
     }
     space->last_received_packet = packet_number;
     conn->conn.last_recv_space = header.space;
+    conn->conn.last_acked_packets = 0;
 
-    if (quic_tls_parse_frames(conn, header.level, plaintext, plaintext_len, &fed_crypto) != 0) {
+    if (quic_tls_parse_frames(conn, header.level, plaintext, plaintext_len, &fed_crypto, &saw_ack_eliciting) != 0) {
         return -1;
+    }
+    if (saw_ack_eliciting) {
+        quic_tls_mark_ack_pending(conn, header.level);
     }
 
     if (header.space == QUIC_PN_SPACE_HANDSHAKE) {
         conn->received_handshake_packet = 1;
+        if (conn->role == QUIC_ROLE_SERVER) {
+            conn->peer_address_validated = 1;
+        }
+    }
+    if (header.space == QUIC_PN_SPACE_APPLICATION && header.level == ssl_encryption_application &&
+        conn->role == QUIC_ROLE_SERVER) {
+        conn->peer_address_validated = 1;
     }
 
     if (fed_crypto) {
@@ -1196,8 +1669,29 @@ int quic_tls_conn_build_next_datagram(quic_tls_conn_t *conn, uint8_t *out, size_
         return quic_tls_fail(conn, "invalid build_next_datagram arguments");
     }
 
+    if (conn->special_packet_pending) {
+        if (out_len < conn->special_packet_len) {
+            return quic_tls_fail(conn, "special packet output buffer too small");
+        }
+        if (quic_tls_server_amplification_limited(conn, conn->special_packet_len)) {
+            return quic_tls_fail(conn, "server amplification limit reached");
+        }
+        memcpy(out, conn->special_packet, conn->special_packet_len);
+        *written = conn->special_packet_len;
+        conn->special_packet_pending = 0;
+        conn->special_packet_len = 0;
+        quic_tls_note_packet_sent(conn, *written);
+        quic_tls_arm_loss_timer(conn);
+        return 0;
+    }
+
     if (quic_tls_level_has_sendable_output(conn, ssl_encryption_initial)) {
         return quic_tls_build_datagram_for_level(conn, ssl_encryption_initial, out, out_len, written);
+    }
+    if (quic_tls_level_has_sendable_output(conn, ssl_encryption_early_data) ||
+        (conn->ping_pending && conn->levels[ssl_encryption_early_data].write_secret_ready &&
+         !conn->handshake_complete)) {
+        return quic_tls_build_datagram_for_level(conn, ssl_encryption_early_data, out, out_len, written);
     }
     if (quic_tls_level_has_sendable_output(conn, ssl_encryption_handshake)) {
         return quic_tls_build_datagram_for_level(conn, ssl_encryption_handshake, out, out_len, written);
@@ -1215,7 +1709,10 @@ int quic_tls_conn_has_pending_output(const quic_tls_conn_t *conn) {
     if (!conn) {
         return 0;
     }
-    return quic_tls_level_has_sendable_output(conn, ssl_encryption_initial) ||
+    return conn->special_packet_pending ||
+           quic_tls_level_has_sendable_output(conn, ssl_encryption_initial) ||
+           quic_tls_level_has_sendable_output(conn, ssl_encryption_early_data) ||
+           (conn->ping_pending && conn->levels[ssl_encryption_early_data].write_secret_ready && !conn->handshake_complete) ||
            quic_tls_level_has_sendable_output(conn, ssl_encryption_handshake) ||
            quic_tls_level_has_sendable_output(conn, ssl_encryption_application) ||
            ((conn->handshake_done_pending || conn->ping_pending) &&
@@ -1249,6 +1746,13 @@ uint64_t quic_tls_conn_loss_deadline_ms(const quic_tls_conn_t *conn) {
         return 0;
     }
     return conn->conn.timers[QUIC_CONN_TIMER_LOSS_DETECTION].deadline_ms;
+}
+
+void quic_tls_conn_enable_retry(quic_tls_conn_t *conn, int enabled) {
+    if (!conn) {
+        return;
+    }
+    conn->retry_required = enabled ? 1 : 0;
 }
 
 void quic_tls_conn_queue_ping(quic_tls_conn_t *conn) {

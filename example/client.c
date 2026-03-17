@@ -164,10 +164,19 @@ int main(int argc, char **argv) {
             if (quic_tls_conn_handshake_complete(&conn) && !ping_enqueued) {
                 quic_tls_conn_queue_ping(&conn);
                 ping_enqueued = 1;
+                if (send_pending_packets(fd, &conn) != 0) {
+                    close(fd);
+                    quic_tls_conn_free(&conn);
+                    return 1;
+                }
             }
         }
 
-        if (conn.handshake_complete && conn.ping_received) {
+        if (conn.handshake_complete &&
+            conn.ping_received &&
+            ping_enqueued &&
+            !conn.ping_pending &&
+            !quic_tls_conn_has_pending_output(&conn)) {
             printf("client handshake complete and received encrypted ping\n");
             close(fd);
             quic_tls_conn_free(&conn);

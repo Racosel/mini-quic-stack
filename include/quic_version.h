@@ -13,6 +13,8 @@ typedef struct {
     const char* hkdf_label_hp;
     // 动态解析长头部包类型（返回 0=Initial，1=0-RTT，2=Handshake，3=Retry）
     uint8_t (*decode_packet_type)(uint8_t header_byte);
+    // 将内部逻辑包类型编码回指定版本的长头部类型位
+    uint8_t (*encode_packet_type)(uint8_t logical_type);
 } quic_version_ops_t;
 
 // 根据版本号获取对应的操作集；如果不支持该版本则返回 NULL

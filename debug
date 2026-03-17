@@ -1,1 +1,149 @@
-2026-03-17 13:07:33 +0800 | 初始化 debug 文件：从现在开始，根目录 debug 专门记录执行过程中遇到的 bug、触发条件、影响范围、定位结论、修复方法与验证结果；每次发现新问题或完成修复后都应实时追加更新。
+# Debug 记录
+
+本文件专门记录开发和调试过程中遇到的 bug、影响、定位、修复方法与验证结果。
+
+## 记录格式
+
+每一条 bug 记录都应尽量使用以下字段：
+
+- `时间`
+- `阶段`
+- `标题`
+- `现象`
+- `影响`
+- `根因`
+- `修复`
+- `验证`
+- `相关文件`
+- `状态`
+
+---
+
+## Bug 001：Stage 1 握手超时与尾部控制帧丢失
+
+- `时间`: 2026-03-17 12:41:00 +0800
+- `阶段`: 阶段 1 / 拓扑自动化验证
+- `标题`: `topo.py --auto` 中 client/server 长时间等待握手完成并超时
+- `现象`:
+  - `sudo python3 topo.py --auto` 中客户端输出 `client timeout waiting for QUIC handshake`
+  - 服务端输出 `server timeout waiting for QUIC handshake`
+  - 本机 UDP 回环下 `example/quic_client` 与 `example/quic_server` 也能复现超时
+- `影响`:
+  - 阶段 1 的 example 无法稳定完成真实 UDP 握手
+  - Mininet 自动验证失败，无法证明当前 QUIC/TLS 路径具备基本抗丢包能力
+- `根因`:
+  - `src/transport/quic_crypto_stream.c` 中 `quic_crypto_recvbuf` 的 `present` 位图首次扩容时可能带入未初始化内容，导致 TLS 层把不存在的 CRYPTO 数据误认为连续数据并错误喂给 BoringSSL
+  - `src/tls/quic_tls.c` 中 application 层 `PING` 与 `HANDSHAKE_DONE` 只有一次发送机会，丢包后不会在 loss timeout 上重新排队，握手尾部容易卡死
+- `修复`:
+  - 重写 `quic_crypto_reserve_bytes()` 的容量处理逻辑，按各自缓冲区的旧容量清零新增区域，避免 `present` 位图脏数据
+  - 为 `PING` 与 `HANDSHAKE_DONE` 增加 `in_flight` 状态，并在 `quic_tls_conn_on_loss_timeout()` 中重新排队
+  - 扩展 `tests/test_phase12.c`，新增 CRYPTO 缺口重组回归测试和 application 控制帧单包丢失重传测试
+- `验证`:
+  - `make test12` 通过
+  - 本机运行 `example/quic_server 127.0.0.1 4434 ...` 与 `example/quic_client 127.0.0.1 4434` 成功，双方均输出 `handshake complete and received encrypted ping`
+- `相关文件`:
+  - `src/transport/quic_crypto_stream.c`
+  - `src/tls/quic_tls.c`
+  - `include/quic_tls.h`
+  - `tests/test_phase12.c`
+- `状态`: 已修复
+
+## Bug 002：Stage 2 Version Negotiation 包 fixed bit 错误
+
+- `时间`: 2026-03-17 14:32:22 +0800
+- `阶段`: 阶段 2 / Version Negotiation
+- `标题`: Version Negotiation 包首字节未设置 fixed bit，导致通用头解析直接拒绝
+- `现象`:
+  - `make test13` 首次运行时在 Version Negotiation 用例中失败
+  - `quic_parse_header_meta()` 无法解析服务端生成的 Version Negotiation 包
+- `影响`:
+  - 阶段 2 的 Version Negotiation 运行时路径不符合 RFC 9000/8999 不变量
+  - 客户端无法把生成的协商包当成合法 QUIC 长包头处理
+- `根因`:
+  - `src/packet/quic_version.c` 中 `quic_generate_version_negotiation()` 使用 `0x80` 作为首字节，只设置了长包头位，没有设置 fixed bit
+- `修复`:
+  - 将 Version Negotiation 包首字节改为 `0xc0`，确保长包头位与 fixed bit 同时为 1
+- `验证`:
+  - `make test2`
+  - `make test13`
+- `相关文件`:
+  - `src/packet/quic_version.c`
+  - `tests/test_phase13.c`
+- `状态`: 已修复
+
+## Bug 003：Stage 2 交错时序下服务端错误重置 Initial 密钥
+
+- `时间`: 2026-03-17 14:50:22 +0800
+- `阶段`: 阶段 2 / 完整包收发管线
+- `标题`: 服务端在后续客户端 Initial 的 DCID 切换后重新派生 Initial 密钥，导致真实 UDP 握手失败
+- `现象`:
+  - `example/quic_server` 在处理客户端后续 Initial 时输出 `failed to remove packet protection`
+  - `example/quic_client` 在真实 UDP 运行中收到 `Connection refused`
+  - 单进程内存测试能通过，但逐包交错调度的真实网络时序会失败
+- `影响`:
+  - 阶段 2 的真实 UDP 握手在客户端收到首个服务端 flight 后无法继续
+  - `example/` 无法稳定完成从 Initial 到 Handshake/1-RTT 的完整切换
+- `根因`:
+  - `src/tls/quic_tls.c` 中 `quic_tls_server_prepare_initial_context()` 会在后续客户端 Initial 的 DCID 从原始 ODCID 切换为服务端 CID 时，误以为需要重置 Initial 上下文并按新 DCID 重新派生 Initial 密钥
+  - QUIC 的 Initial 密钥在无 Retry 情况下必须继续使用客户端首个 Initial 的 ODCID，而不是后续包头里的当前 DCID
+- `修复`:
+  - 将服务端 Initial 上下文重置条件收紧为“仅在 `initial_dcid` 尚未建立时才初始化”，不再因为后续 Initial 包头里的 DCID 变化而重新派生
+  - 在 `tests/test_phase13.c` 增加“交错投递的后续 Initial ACK”回归测试，覆盖真实网络下的逐包时序
+- `验证`:
+  - `make test13`
+  - `make test12 test13`
+  - 本机 `./example/quic_server 127.0.0.1 4434` 与 `./example/quic_client 127.0.0.1 4434` 握手通过
+- `相关文件`:
+  - `src/tls/quic_tls.c`
+  - `tests/test_phase13.c`
+- `状态`: 已修复
+
+## Bug 004：Stage 2 example 在本端 PING 真正发出前提前退出
+
+- `时间`: 2026-03-17 14:54:57 +0800
+- `阶段`: 阶段 2 / example 端到端验证
+- `标题`: `example/server` 与 `example/client` 会在排队 `PING` 后但尚未发送时提前退出
+- `现象`:
+  - 服务端已经打印 `handshake complete and received encrypted ping`，但客户端仍报 `Connection refused`
+  - 客户端或服务端可能在刚把本端 `PING` 放入待发送队列后，就因为已经收到了对端 `PING` 而直接退出
+- `影响`:
+  - 示例程序不能稳定证明双方都完成了 1-RTT 加密控制帧交换
+  - 自动化示例验证会出现单边成功、单边失败的假阴性结果
+- `根因`:
+  - `example/server.c` 和 `example/client.c` 在收到握手完成后只负责 `queue_ping()`，但退出条件没有保证该 `PING` 已经实际发送出去
+  - 在真实 UDP 调度下，进程可能在下一轮 `send_pending_packets()` 之前就直接返回
+- `修复`:
+  - 在 `queue_ping()` 后立即调用 `send_pending_packets()` 发送本端待发包
+  - 将退出条件收紧为：握手完成、已收到对端 `PING`、本端 `PING` 已经排队过，且当前不再存在待发送输出
+- `验证`:
+  - `make quic-demo`
+  - 本机 `./example/quic_server 127.0.0.1 4434` 与 `./example/quic_client 127.0.0.1 4434` 均成功输出 `handshake complete and received encrypted ping`
+- `相关文件`:
+  - `example/server.c`
+  - `example/client.c`
+- `状态`: 已修复
+
+## Bug 005：Mininet 拓扑中的 HTB quantum warning
+
+- `时间`: 2026-03-17 15:06:39 +0800
+- `阶段`: 验证环境 / `topo.py`
+- `标题`: `topo.py --auto` 在创建链路时持续打印 `sch_htb: quantum of class 50001 is big`
+- `现象`:
+  - Mininet 在 `net.addLink(..., bw=100, ...)` 时多次输出 `sch_htb: quantum of class 50001 is big. Consider r2q change.`
+  - QUIC 握手本身仍能成功，但输出包含重复 warning
+- `影响`:
+  - 自动化验证输出有噪声，容易被误判为协议错误
+  - 拓扑整形配置与 Mininet 实际生效的 qdisc 不一致，不利于后续稳定维护
+- `根因`:
+  - 本机 Mininet 的 `TCIntf.config()` 实际只支持 `use_hfsc` 和 `use_tbf`，不会识别 `use_htb`
+  - `topo.py` 传入 `use_htb=True` 后，带宽整形仍走默认 HTB 分支；在 `100Mbit` 配置下，内核 `sch_htb` 打印 quantum warning
+- `修复`:
+  - 将 `topo.py` 的链路整形切换为显式 `TBF + netem`
+  - 统一使用 `link_shape = {"bw": 100, "use_tbf": True, "latency_ms": 50}`
+  - 保留原有 `delay` / `loss` 语义，由 `netem` 继续叠加时延与丢包
+- `验证`:
+  - `python3 -m py_compile topo.py` 通过
+  - 运行层面的最终确认需要再次执行 `sudo python3 topo.py --auto` 检查 warning 是否消失
+- `相关文件`:
+  - `topo.py`
+- `状态`: 已修复，用户已验证无报错

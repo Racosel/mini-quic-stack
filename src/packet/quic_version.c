@@ -18,6 +18,10 @@ static uint8_t v1_decode_packet_type(uint8_t header_byte) {
     return type; 
 }
 
+static uint8_t v1_encode_packet_type(uint8_t logical_type) {
+    return logical_type & 0x03;
+}
+
 static const quic_version_ops_t v1_ops = {
     .version_id = QUIC_V1_VERSION,
     .initial_salt = v1_salt,
@@ -25,7 +29,8 @@ static const quic_version_ops_t v1_ops = {
     .hkdf_label_key = "quic key",
     .hkdf_label_iv = "quic iv",
     .hkdf_label_hp = "quic hp",
-    .decode_packet_type = v1_decode_packet_type
+    .decode_packet_type = v1_decode_packet_type,
+    .encode_packet_type = v1_encode_packet_type
 };
 
 // ============================================================================
@@ -49,6 +54,16 @@ static uint8_t v2_decode_packet_type(uint8_t header_byte) {
     }
 }
 
+static uint8_t v2_encode_packet_type(uint8_t logical_type) {
+    switch (logical_type & 0x03) {
+        case 0: return 1; // Initial
+        case 1: return 2; // 0-RTT
+        case 2: return 3; // Handshake
+        case 3: return 0; // Retry
+        default: return 0;
+    }
+}
+
 static const quic_version_ops_t v2_ops = {
     .version_id = QUIC_V2_VERSION,
     .initial_salt = v2_salt,
@@ -56,7 +71,8 @@ static const quic_version_ops_t v2_ops = {
     .hkdf_label_key = "quicv2 key",
     .hkdf_label_iv = "quicv2 iv",
     .hkdf_label_hp = "quicv2 hp",
-    .decode_packet_type = v2_decode_packet_type
+    .decode_packet_type = v2_decode_packet_type,
+    .encode_packet_type = v2_encode_packet_type
 };
 
 // ============================================================================
@@ -83,8 +99,8 @@ int quic_generate_version_negotiation(const quic_pkt_header_meta_t *in_meta, uin
 
     size_t offset = 0;
     
-    // 1. 首字节（必须设置长包头标志位，其余位可随机，以降低特征识别）
-    out_buf[offset++] = 0x80; 
+    // 1. 首字节：Version Negotiation 仍属于长包头，并且 fixed bit 必须为 1
+    out_buf[offset++] = 0xc0;
     
     // 2. 版本字段必须为 0x00000000
     out_buf[offset++] = 0x00;

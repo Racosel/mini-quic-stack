@@ -1,4 +1,5 @@
 #include "quic_ack.h"
+#include "quic_frame.h"
 #include "quic_varint.h"
 #include <string.h>
 
@@ -65,6 +66,66 @@ int quic_ack_parse_frame(const uint8_t *frame, size_t frame_len, quic_ack_frame_
     }
 
     *consumed = offset;
+    return 0;
+}
+
+int quic_ack_encode_frame(const quic_ack_frame_t *ack, uint8_t *out, size_t out_len, size_t *written) {
+    size_t offset = 0;
+    int rc;
+
+    if (!ack || !out || !written || ack->ack_range_count == 0) {
+        return -1;
+    }
+    if (ack->has_ecn) {
+        return -1;
+    }
+    if (ack->ranges[0].largest != ack->largest_acked ||
+        ack->ranges[0].smallest > ack->ranges[0].largest) {
+        return -1;
+    }
+
+    rc = quic_encode_varint(ack->has_ecn ? QUIC_FRAME_ACK_ECN : QUIC_FRAME_ACK, out + offset, out_len - offset);
+    if (rc < 0) return -1;
+    offset += (size_t)rc;
+
+    rc = quic_encode_varint(ack->largest_acked, out + offset, out_len - offset);
+    if (rc < 0) return -1;
+    offset += (size_t)rc;
+
+    rc = quic_encode_varint(ack->ack_delay, out + offset, out_len - offset);
+    if (rc < 0) return -1;
+    offset += (size_t)rc;
+
+    rc = quic_encode_varint(ack->ack_range_count - 1, out + offset, out_len - offset);
+    if (rc < 0) return -1;
+    offset += (size_t)rc;
+
+    rc = quic_encode_varint(ack->ranges[0].largest - ack->ranges[0].smallest, out + offset, out_len - offset);
+    if (rc < 0) return -1;
+    offset += (size_t)rc;
+
+    for (size_t i = 1; i < ack->ack_range_count; i++) {
+        uint64_t gap;
+        uint64_t range_len;
+
+        if (ack->ranges[i].smallest > ack->ranges[i].largest ||
+            ack->ranges[i - 1].smallest < ack->ranges[i].largest + 2) {
+            return -1;
+        }
+
+        gap = ack->ranges[i - 1].smallest - ack->ranges[i].largest - 2;
+        range_len = ack->ranges[i].largest - ack->ranges[i].smallest;
+
+        rc = quic_encode_varint(gap, out + offset, out_len - offset);
+        if (rc < 0) return -1;
+        offset += (size_t)rc;
+
+        rc = quic_encode_varint(range_len, out + offset, out_len - offset);
+        if (rc < 0) return -1;
+        offset += (size_t)rc;
+    }
+
+    *written = offset;
     return 0;
 }
 

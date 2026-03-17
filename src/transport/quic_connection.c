@@ -346,6 +346,10 @@ void quic_conn_discard_space(quic_connection_t *conn, quic_pn_space_id_t space_i
     quic_crypto_discard_level(&space->tx_crypto);
     space->rx_keys_ready = 0;
     space->tx_keys_ready = 0;
+    quic_queue_clear(&space->in_flight);
+    space->largest_received_packet = 0;
+    space->last_received_packet = 0;
+    space->next_packet_number = 0;
 }
 
 int quic_conn_set_initial_keys(quic_connection_t *conn, uint32_t version, const quic_cid_t *original_dcid) {

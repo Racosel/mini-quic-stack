@@ -27,8 +27,10 @@ def build_network():
     h2 = net.addHost("h2", ip="10.0.0.2/24", mac="00:00:00:00:00:02")
 
     info("*** 创建带有网络特性的链路 ***\n")
-    net.addLink(h1, s1, bw=100, delay="20ms", loss=2, use_htb=True)
-    net.addLink(h2, s1, bw=100, delay="10ms", use_htb=True)
+    # 显式使用 TBF，避免 Mininet 默认 HTB 在 100Mbit 下反复打印 quantum warning。
+    link_shape = {"bw": 100, "use_tbf": True, "latency_ms": 50}
+    net.addLink(h1, s1, delay="20ms", loss=2, **link_shape)
+    net.addLink(h2, s1, delay="10ms", **link_shape)
 
     return net
 

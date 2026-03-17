@@ -8,6 +8,27 @@ void quic_queue_init(quic_in_flight_queue_t *q) {
     q->largest_acked_packet = 0;
 }
 
+void quic_queue_clear(quic_in_flight_queue_t *q) {
+    quic_sent_packet_t *curr;
+    quic_sent_packet_t *next;
+
+    if (!q) {
+        return;
+    }
+
+    curr = q->head;
+    while (curr) {
+        next = curr->next;
+        free(curr);
+        curr = next;
+    }
+
+    q->head = NULL;
+    q->tail = NULL;
+    q->bytes_in_flight = 0;
+    q->largest_acked_packet = 0;
+}
+
 void quic_on_packet_sent(quic_in_flight_queue_t *q, uint64_t pn, size_t len, int ack_eliciting) {
     quic_sent_packet_t *p = malloc(sizeof(quic_sent_packet_t));
     p->packet_number = pn;

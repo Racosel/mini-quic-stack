@@ -24,6 +24,7 @@ typedef struct {
 } quic_ack_frame_t;
 
 int quic_ack_parse_frame(const uint8_t *frame, size_t frame_len, quic_ack_frame_t *ack, size_t *consumed);
+int quic_ack_encode_frame(const quic_ack_frame_t *ack, uint8_t *out, size_t out_len, size_t *written);
 int quic_on_ack_frame(quic_in_flight_queue_t *q, const quic_ack_frame_t *ack, size_t *acked_packets);
 
 #endif // QUIC_ACK_H：头文件保护结束
