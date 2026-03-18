@@ -12,8 +12,9 @@ typedef enum {
     QUIC_CONN_STATE_NEW = 0,
     QUIC_CONN_STATE_HANDSHAKING = 1,
     QUIC_CONN_STATE_ACTIVE = 2,
-    QUIC_CONN_STATE_DRAINING = 3,
-    QUIC_CONN_STATE_CLOSED = 4
+    QUIC_CONN_STATE_CLOSING = 3,
+    QUIC_CONN_STATE_DRAINING = 4,
+    QUIC_CONN_STATE_CLOSED = 5
 } quic_conn_state_t;
 
 typedef enum {
@@ -54,6 +55,8 @@ typedef struct {
 typedef struct {
     quic_pn_space_id_t id;
     quic_in_flight_queue_t in_flight;
+    quic_ack_range_t ack_ranges[QUIC_MAX_ACK_RANGES];
+    size_t ack_range_count;
     uint64_t largest_received_packet;
     uint64_t last_received_packet;
     uint64_t next_packet_number;

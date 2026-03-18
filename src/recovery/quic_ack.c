@@ -12,6 +12,83 @@ static int quic_pn_in_ack_ranges(uint64_t pn, const quic_ack_frame_t *ack) {
     return 0;
 }
 
+void quic_ack_ranges_init(quic_ack_range_t *ranges, size_t *range_count) {
+    if (!ranges || !range_count) {
+        return;
+    }
+    memset(ranges, 0, sizeof(quic_ack_range_t) * QUIC_MAX_ACK_RANGES);
+    *range_count = 0;
+}
+
+int quic_ack_note_received(quic_ack_range_t *ranges, size_t *range_count, uint64_t packet_number) {
+    size_t count;
+    size_t insert_at;
+    size_t i;
+
+    if (!ranges || !range_count) {
+        return -1;
+    }
+
+    count = *range_count;
+    for (i = 0; i < count; i++) {
+        if (packet_number >= ranges[i].smallest && packet_number <= ranges[i].largest) {
+            return 0;
+        }
+    }
+
+    insert_at = count;
+    for (i = 0; i < count; i++) {
+        if (packet_number > ranges[i].largest) {
+            insert_at = i;
+            break;
+        }
+    }
+
+    if (count == QUIC_MAX_ACK_RANGES) {
+        if (insert_at == count) {
+            return 0;
+        }
+        count--;
+    }
+
+    for (i = count; i > insert_at; i--) {
+        ranges[i] = ranges[i - 1];
+    }
+    ranges[insert_at].largest = packet_number;
+    ranges[insert_at].smallest = packet_number;
+    count++;
+
+    i = 0;
+    while (i + 1 < count) {
+        if (ranges[i].smallest <= ranges[i + 1].largest + 1) {
+            if (ranges[i + 1].smallest < ranges[i].smallest) {
+                ranges[i].smallest = ranges[i + 1].smallest;
+            }
+            memmove(&ranges[i + 1],
+                    &ranges[i + 2],
+                    sizeof(quic_ack_range_t) * (count - (i + 2)));
+            count--;
+            continue;
+        }
+        i++;
+    }
+
+    *range_count = count;
+    return 0;
+}
+
+int quic_ack_frame_from_ranges(const quic_ack_range_t *ranges, size_t range_count, quic_ack_frame_t *ack) {
+    if (!ranges || !ack || range_count == 0 || range_count > QUIC_MAX_ACK_RANGES) {
+        return -1;
+    }
+
+    memset(ack, 0, sizeof(*ack));
+    ack->largest_acked = ranges[0].largest;
+    ack->ack_range_count = range_count;
+    memcpy(ack->ranges, ranges, sizeof(quic_ack_range_t) * range_count);
+    return 0;
+}
+
 int quic_ack_parse_frame(const uint8_t *frame, size_t frame_len, quic_ack_frame_t *ack, size_t *consumed) {
     size_t offset = 0;
     uint64_t frame_type, ack_range_count, first_ack_range;

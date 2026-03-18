@@ -19,6 +19,18 @@ static quic_conn_pn_space_t *quic_conn_space(quic_connection_t *conn, quic_pn_sp
     return &conn->spaces[space_id];
 }
 
+static void quic_conn_note_received_packet(quic_conn_pn_space_t *space, uint64_t packet_number) {
+    if (!space) {
+        return;
+    }
+
+    space->last_received_packet = packet_number;
+    if (packet_number > space->largest_received_packet) {
+        space->largest_received_packet = packet_number;
+    }
+    (void)quic_ack_note_received(space->ack_ranges, &space->ack_range_count, packet_number);
+}
+
 static int quic_skip_varint(const uint8_t *payload, size_t payload_len, size_t *offset) {
     uint64_t ignored;
     return quic_decode_varint(payload, payload_len, offset, &ignored);
@@ -243,10 +255,7 @@ static int quic_conn_recv_initial_space(quic_connection_t *conn, uint8_t *packet
         return QUIC_CONN_ERR_DECODE;
     }
 
-    space->last_received_packet = packet_number;
-    if (packet_number > space->largest_received_packet) {
-        space->largest_received_packet = packet_number;
-    }
+    quic_conn_note_received_packet(space, packet_number);
 
     conn->last_received_packet = packet_number;
     conn->last_recv_space = QUIC_PN_SPACE_INITIAL;
@@ -276,6 +285,7 @@ void quic_conn_init(quic_connection_t *conn) {
     for (size_t i = 0; i < QUIC_PN_SPACE_COUNT; i++) {
         conn->spaces[i].id = (quic_pn_space_id_t)i;
         quic_queue_init(&conn->spaces[i].in_flight);
+        quic_ack_ranges_init(conn->spaces[i].ack_ranges, &conn->spaces[i].ack_range_count);
     }
 }
 
@@ -347,6 +357,7 @@ void quic_conn_discard_space(quic_connection_t *conn, quic_pn_space_id_t space_i
     space->rx_keys_ready = 0;
     space->tx_keys_ready = 0;
     quic_queue_clear(&space->in_flight);
+    quic_ack_ranges_init(space->ack_ranges, &space->ack_range_count);
     space->largest_received_packet = 0;
     space->last_received_packet = 0;
     space->next_packet_number = 0;

@@ -6,8 +6,8 @@
 #include <stdio.h>
 #include <string.h>
 
-#define TEST_CERT_FILE "example/server_cert.pem"
-#define TEST_KEY_FILE  "example/server_key.pem"
+#define TEST_CERT_FILE "tests/certs/server_cert.pem"
+#define TEST_KEY_FILE  "tests/certs/server_key.pem"
 
 typedef struct {
     uint8_t bytes[QUIC_TLS_MAX_DATAGRAM_SIZE];
@@ -283,10 +283,18 @@ static void test_stage2_anti_amplification_limit(void) {
 
     assert(quic_tls_conn_handle_datagram(&server, unsupported_packet, sizeof(unsupported_packet)) == 0);
     server.bytes_sent = server.bytes_received * 3;
-    assert(quic_tls_conn_build_next_datagram(&server, packet, sizeof(packet), &written) != 0);
+    assert(quic_tls_conn_build_next_datagram(&server, packet, sizeof(packet), &written) == QUIC_TLS_BUILD_BLOCKED);
+    assert(written == 0);
+    assert(server.amplification_blocked);
+    assert(quic_tls_conn_loss_deadline_ms(&server) == 0);
+
+    assert(quic_tls_conn_handle_datagram(&server, unsupported_packet, sizeof(unsupported_packet)) == 0);
+    assert(!server.amplification_blocked);
+    assert(quic_tls_conn_build_next_datagram(&server, packet, sizeof(packet), &written) == 0);
+    assert(written > 0);
 
     quic_tls_conn_free(&server);
-    printf("[PASS] Stage 2 anti-amplification blocks sends beyond 3x budget\n");
+    printf("[PASS] Stage 2 anti-amplification blocks sends without failing and resumes after new credit\n");
 }
 
 static void test_stage2_zero_rtt_and_short_header_paths(void) {
@@ -334,11 +342,65 @@ static void test_stage2_zero_rtt_and_short_header_paths(void) {
     assert(capture_one(&server, &packet) == 1);
     assert((packet.bytes[0] & 0x80) == 0);
     assert(quic_tls_conn_handle_datagram(&client, packet.bytes, packet.len) == 0);
+    assert(client.conn.spaces[QUIC_PN_SPACE_APPLICATION].in_flight.bytes_in_flight > 0);
+    client.handshake_complete = 1;
+    client.conn.state = QUIC_CONN_STATE_ACTIVE;
+    assert(quic_tls_conn_handle_datagram(&client, packet.bytes, packet.len) == 0);
     assert(client.conn.spaces[QUIC_PN_SPACE_APPLICATION].in_flight.bytes_in_flight == 0);
 
     quic_tls_conn_free(&client);
     quic_tls_conn_free(&server);
     printf("[PASS] Stage 2 0-RTT long header and short-header ACK paths work\n");
+}
+
+static void test_stage2_application_packet_without_rx_keys_is_ignored(void) {
+    quic_tls_conn_t client;
+    quic_tls_conn_t server;
+    quic_crypto_context_t keys;
+    quic_cid_t client_cid = make_cid(0x51);
+    quic_cid_t server_cid = make_cid(0xa1);
+    captured_packet_t packet;
+
+    quic_tls_conn_init(&client);
+    quic_tls_conn_init(&server);
+
+    client.role = QUIC_ROLE_CLIENT;
+    client.version = QUIC_V1_VERSION;
+    client.version_ops = quic_version_get_ops(QUIC_V1_VERSION);
+    client.local_cid = client_cid;
+    client.peer_cid = server_cid;
+    client.peer_cid_known = 1;
+    client.handshake_complete = 1;
+    client.conn.state = QUIC_CONN_STATE_ACTIVE;
+
+    server.role = QUIC_ROLE_SERVER;
+    server.version = QUIC_V1_VERSION;
+    server.version_ops = quic_version_get_ops(QUIC_V1_VERSION);
+    server.local_cid = server_cid;
+    server.peer_cid = client_cid;
+    server.peer_cid_known = 1;
+    server.peer_address_validated = 1;
+
+    assert(quic_crypto_setup_initial_keys(&server_cid, client.version_ops, &keys) == 0);
+    assert(quic_conn_install_tx_keys(&client.conn, QUIC_PN_SPACE_APPLICATION, &keys.client_initial) == QUIC_CONN_OK);
+    client.levels[ssl_encryption_application].write_secret_ready = 1;
+
+    quic_tls_conn_queue_ping(&client);
+    assert(capture_one(&client, &packet) == 1);
+    assert((packet.bytes[0] & 0x80) == 0);
+    assert(quic_tls_conn_handle_datagram(&server, packet.bytes, packet.len) == 0);
+    assert(!server.ping_received);
+
+    assert(quic_conn_install_rx_keys(&server.conn, QUIC_PN_SPACE_APPLICATION, &keys.client_initial) == QUIC_CONN_OK);
+    server.levels[ssl_encryption_application].read_secret_ready = 1;
+    server.handshake_complete = 1;
+    server.conn.state = QUIC_CONN_STATE_ACTIVE;
+    assert(quic_tls_conn_handle_datagram(&server, packet.bytes, packet.len) == 0);
+    assert(server.ping_received);
+
+    quic_tls_conn_free(&client);
+    quic_tls_conn_free(&server);
+    printf("[PASS] Stage 2 application packets without RX keys are ignored until keys are ready\n");
 }
 
 int main(void) {
@@ -348,6 +410,7 @@ int main(void) {
     test_stage2_version_negotiation();
     test_stage2_anti_amplification_limit();
     test_stage2_zero_rtt_and_short_header_paths();
+    test_stage2_application_packet_without_rx_keys_is_ignored();
     printf("Phase 13 tests passed.\n");
     return 0;
 }

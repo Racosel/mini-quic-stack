@@ -14,6 +14,9 @@
 
 #define QUIC_TLS_CIPHER_AES_128_GCM_SHA256 0x1301
 #define QUIC_TLS_MAX_CRYPTO_CHUNK 1000
+#define QUIC_STREAM_MAX_OFFSET ((1ULL << 62) - 1)
+#define QUIC_TLS_STREAM_PACKET_RESERVE 64
+#define QUIC_TLS_CLOSE_TIMEOUT_MS (QUIC_TLS_RETRANSMIT_TIMEOUT_MS * 3ULL)
 
 static const uint8_t quic_tls_alpn[] = { 0x07, 'a', 'i', '-', 'q', 'u', 'i', 'c' };
 
@@ -42,6 +45,9 @@ static uint64_t quic_tls_now_ms(void) {
 }
 
 static void quic_tls_arm_loss_timer(quic_tls_conn_t *conn);
+static int quic_tls_prepare_connection_close(quic_tls_conn_t *conn,
+                                             uint64_t error_code,
+                                             int enter_draining_after_send);
 
 static int quic_tls_server_alpn_cb(SSL *ssl,
                                    const uint8_t **out,
@@ -105,6 +111,50 @@ static size_t quic_tls_varint_len(uint64_t value) {
     return rc < 0 ? 0 : (size_t)rc;
 }
 
+static uint64_t quic_tls_transport_param_value(const quic_transport_varint_param_t *param) {
+    return (param && param->present) ? param->value : 0;
+}
+
+static int quic_tls_append_varint(uint64_t value, uint8_t *out, size_t out_len, size_t *offset) {
+    int rc;
+
+    if (!out || !offset || *offset > out_len) {
+        return -1;
+    }
+    rc = quic_encode_varint(value, out + *offset, out_len - *offset);
+    if (rc < 0) {
+        return -1;
+    }
+    *offset += (size_t)rc;
+    return 0;
+}
+
+static int quic_tls_streams_have_inflight(const quic_stream_map_t *map) {
+    size_t i;
+
+    if (!map) {
+        return 0;
+    }
+    if (map->max_data_in_flight || map->max_streams_bidi_in_flight || map->max_streams_uni_in_flight) {
+        return 1;
+    }
+    for (i = 0; i < QUIC_STREAM_MAX_COUNT; i++) {
+        const quic_stream_t *stream = &map->streams[i];
+
+        if (!stream->active) {
+            continue;
+        }
+        if (stream->fin_in_flight ||
+            stream->stop_sending_in_flight ||
+            stream->reset_in_flight ||
+            stream->max_stream_data_in_flight ||
+            (stream->sendbuf.flight_pending && stream->sendbuf.flight_end > stream->sendbuf.flight_start)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static quic_pn_space_id_t quic_tls_space_from_level(enum ssl_encryption_level_t level) {
     switch (level) {
         case ssl_encryption_initial:
@@ -127,6 +177,47 @@ static int quic_tls_is_supported_level(enum ssl_encryption_level_t level) {
            level == ssl_encryption_application;
 }
 
+static int quic_tls_close_state_active(const quic_tls_conn_t *conn) {
+    return conn &&
+           (conn->conn.state == QUIC_CONN_STATE_CLOSING ||
+            conn->conn.state == QUIC_CONN_STATE_DRAINING);
+}
+
+static int quic_tls_should_discard_without_processing(const quic_tls_conn_t *conn,
+                                                      const quic_tls_packet_header_t *header) {
+    if (!conn || !header) {
+        return 0;
+    }
+
+    if (header->level == ssl_encryption_early_data && conn->role == QUIC_ROLE_CLIENT) {
+        return 1;
+    }
+
+    // RFC 9001 5.7: endpoints MUST NOT process incoming 1-RTT packets
+    // before the handshake is complete. Servers may send them earlier,
+    // but receivers have to defer or discard them.
+    if (header->level == ssl_encryption_application && !conn->handshake_complete) {
+        return 1;
+    }
+
+    return 0;
+}
+
+static void quic_tls_enter_draining(quic_tls_conn_t *conn, uint64_t deadline_ms) {
+    if (!conn) {
+        return;
+    }
+
+    conn->conn.state = QUIC_CONN_STATE_DRAINING;
+    conn->close_pending = 0;
+    conn->close_enter_draining_after_send = 0;
+    if (deadline_ms != 0) {
+        conn->close_deadline_ms = deadline_ms;
+    } else if (conn->close_deadline_ms == 0) {
+        conn->close_deadline_ms = quic_tls_now_ms() + QUIC_TLS_CLOSE_TIMEOUT_MS;
+    }
+}
+
 static enum ssl_encryption_level_t quic_tls_ack_level_for_rx(enum ssl_encryption_level_t level) {
     return level == ssl_encryption_early_data ? ssl_encryption_application : level;
 }
@@ -146,6 +237,7 @@ static void quic_tls_note_packet_sent(quic_tls_conn_t *conn, size_t packet_len) 
     if (!conn) {
         return;
     }
+    conn->amplification_blocked = 0;
     conn->bytes_sent += packet_len;
 }
 
@@ -154,6 +246,21 @@ static void quic_tls_note_packet_received(quic_tls_conn_t *conn, size_t packet_l
         return;
     }
     conn->bytes_received += packet_len;
+    if (conn->amplification_blocked) {
+        conn->amplification_blocked = 0;
+        quic_tls_arm_loss_timer(conn);
+    }
+}
+
+static int quic_tls_build_blocked(quic_tls_conn_t *conn, size_t *written) {
+    if (written) {
+        *written = 0;
+    }
+    if (conn) {
+        conn->amplification_blocked = 1;
+        quic_tls_arm_loss_timer(conn);
+    }
+    return QUIC_TLS_BUILD_BLOCKED;
 }
 
 static int quic_tls_has_live_flight(const quic_tls_conn_t *conn) {
@@ -162,12 +269,16 @@ static int quic_tls_has_live_flight(const quic_tls_conn_t *conn) {
     if (!conn) {
         return 0;
     }
+    if (quic_tls_close_state_active(conn)) {
+        return conn->close_deadline_ms != 0;
+    }
 
     if (conn->ping_pending ||
         conn->ping_in_flight ||
         conn->handshake_done_pending ||
         conn->handshake_done_in_flight ||
-        conn->special_packet_pending) {
+        conn->special_packet_pending ||
+        quic_tls_streams_have_inflight(&conn->streams)) {
         return 1;
     }
 
@@ -182,11 +293,17 @@ static int quic_tls_has_live_flight(const quic_tls_conn_t *conn) {
 
 static int quic_tls_level_has_sendable_output(const quic_tls_conn_t *conn, enum ssl_encryption_level_t level) {
     quic_pn_space_id_t space = quic_tls_space_from_level(level);
+    int has_stream_output = 0;
 
     if (!conn || space == QUIC_PN_SPACE_COUNT) {
         return 0;
     }
-    return (quic_crypto_sendbuf_has_pending(&conn->levels[level].send) || conn->levels[level].ack_pending) &&
+    if (level == ssl_encryption_application) {
+        has_stream_output = quic_stream_map_has_pending_output(&conn->streams);
+    }
+    return (quic_crypto_sendbuf_has_pending(&conn->levels[level].send) ||
+            conn->levels[level].ack_pending ||
+            has_stream_output) &&
            conn->conn.spaces[space].tx_keys_ready;
 }
 
@@ -203,6 +320,22 @@ static int quic_tls_queue_special_packet(quic_tls_conn_t *conn, const uint8_t *p
 
 static void quic_tls_arm_loss_timer(quic_tls_conn_t *conn) {
     if (!conn) {
+        return;
+    }
+    if (quic_tls_close_state_active(conn)) {
+        if (conn->close_deadline_ms != 0) {
+            quic_conn_arm_timer(&conn->conn,
+                                QUIC_CONN_TIMER_LOSS_DETECTION,
+                                conn->close_deadline_ms);
+        } else {
+            quic_conn_disarm_timer(&conn->conn, QUIC_CONN_TIMER_LOSS_DETECTION);
+        }
+        return;
+    }
+    if (conn->role == QUIC_ROLE_SERVER &&
+        conn->amplification_blocked &&
+        !conn->peer_address_validated) {
+        quic_conn_disarm_timer(&conn->conn, QUIC_CONN_TIMER_LOSS_DETECTION);
         return;
     }
     if (quic_tls_has_live_flight(conn)) {
@@ -238,6 +371,13 @@ static int quic_tls_update_peer_transport_params(quic_tls_conn_t *conn) {
         return quic_tls_fail(conn, "failed to decode peer transport params");
     }
 
+    quic_stream_map_set_peer_limits(&conn->streams,
+                                    quic_tls_transport_param_value(&conn->peer_transport_params.initial_max_data),
+                                    quic_tls_transport_param_value(&conn->peer_transport_params.initial_max_stream_data_bidi_local),
+                                    quic_tls_transport_param_value(&conn->peer_transport_params.initial_max_stream_data_bidi_remote),
+                                    quic_tls_transport_param_value(&conn->peer_transport_params.initial_max_stream_data_uni),
+                                    quic_tls_transport_param_value(&conn->peer_transport_params.initial_max_streams_bidi),
+                                    quic_tls_transport_param_value(&conn->peer_transport_params.initial_max_streams_uni));
     conn->peer_transport_params_ready = 1;
     return 0;
 }
@@ -332,17 +472,17 @@ static int quic_tls_set_transport_params(quic_tls_conn_t *conn) {
     conn->local_transport_params.max_idle_timeout.present = 1;
     conn->local_transport_params.max_idle_timeout.value = 30000;
     conn->local_transport_params.initial_max_data.present = 1;
-    conn->local_transport_params.initial_max_data.value = 65536;
+    conn->local_transport_params.initial_max_data.value = conn->initial_max_data;
     conn->local_transport_params.initial_max_stream_data_bidi_local.present = 1;
-    conn->local_transport_params.initial_max_stream_data_bidi_local.value = 16384;
+    conn->local_transport_params.initial_max_stream_data_bidi_local.value = conn->initial_max_stream_data_bidi_local;
     conn->local_transport_params.initial_max_stream_data_bidi_remote.present = 1;
-    conn->local_transport_params.initial_max_stream_data_bidi_remote.value = 16384;
+    conn->local_transport_params.initial_max_stream_data_bidi_remote.value = conn->initial_max_stream_data_bidi_remote;
     conn->local_transport_params.initial_max_stream_data_uni.present = 1;
-    conn->local_transport_params.initial_max_stream_data_uni.value = 16384;
+    conn->local_transport_params.initial_max_stream_data_uni.value = conn->initial_max_stream_data_uni;
     conn->local_transport_params.initial_max_streams_bidi.present = 1;
-    conn->local_transport_params.initial_max_streams_bidi.value = 4;
+    conn->local_transport_params.initial_max_streams_bidi.value = conn->initial_max_streams_bidi;
     conn->local_transport_params.initial_max_streams_uni.present = 1;
-    conn->local_transport_params.initial_max_streams_uni.value = 4;
+    conn->local_transport_params.initial_max_streams_uni.value = conn->initial_max_streams_uni;
     conn->local_transport_params.active_connection_id_limit.present = 1;
     conn->local_transport_params.active_connection_id_limit.value = 4;
     conn->local_transport_params.initial_source_connection_id.present = 1;
@@ -369,6 +509,13 @@ static int quic_tls_set_transport_params(quic_tls_conn_t *conn) {
         return quic_tls_fail_ssl(conn, "failed to set local transport params");
     }
 
+    quic_stream_map_set_local_limits(&conn->streams,
+                                     conn->initial_max_data,
+                                     conn->initial_max_stream_data_bidi_local,
+                                     conn->initial_max_stream_data_bidi_remote,
+                                     conn->initial_max_stream_data_uni,
+                                     conn->initial_max_streams_bidi,
+                                     conn->initial_max_streams_uni);
     conn->transport_params_set = 1;
     return 0;
 }
@@ -602,17 +749,52 @@ static void quic_tls_mark_ack_pending(quic_tls_conn_t *conn, enum ssl_encryption
     conn->levels[ack_level].ack_pending = 1;
 }
 
+static int quic_tls_on_peer_connection_close(quic_tls_conn_t *conn) {
+    uint64_t close_deadline_ms;
+
+    if (!conn) {
+        return quic_tls_fail(conn, "invalid peer close state");
+    }
+
+    conn->close_received = 1;
+    close_deadline_ms = conn->close_deadline_ms != 0
+                            ? conn->close_deadline_ms
+                            : (quic_tls_now_ms() + QUIC_TLS_CLOSE_TIMEOUT_MS);
+
+    if (conn->conn.state == QUIC_CONN_STATE_CLOSED || conn->conn.state == QUIC_CONN_STATE_DRAINING) {
+        quic_tls_enter_draining(conn, close_deadline_ms);
+        quic_tls_arm_loss_timer(conn);
+        return 0;
+    }
+    if (conn->conn.state == QUIC_CONN_STATE_CLOSING) {
+        quic_tls_enter_draining(conn, close_deadline_ms);
+        quic_tls_arm_loss_timer(conn);
+        return 0;
+    }
+
+    if (quic_tls_prepare_connection_close(conn, QUIC_TRANSPORT_ERROR_NO_ERROR, 1) != 0) {
+        conn->close_pending = 0;
+        conn->close_packet_len = 0;
+        quic_tls_enter_draining(conn, close_deadline_ms);
+        quic_tls_arm_loss_timer(conn);
+    }
+    return 0;
+}
+
 static int quic_tls_parse_frames(quic_tls_conn_t *conn,
                                  enum ssl_encryption_level_t level,
                                  const uint8_t *plaintext,
                                  size_t plaintext_len,
                                  int *fed_crypto,
-                                 int *saw_ack_eliciting) {
+                                 int *saw_ack_eliciting,
+                                 int *received_connection_close) {
     size_t offset = 0;
 
-    if (!conn || !plaintext || !fed_crypto || !saw_ack_eliciting) {
+    if (!conn || !plaintext || !fed_crypto || !saw_ack_eliciting || !received_connection_close) {
         return quic_tls_fail(conn, "invalid frame parsing arguments");
     }
+
+    *received_connection_close = 0;
 
     while (offset < plaintext_len) {
         size_t frame_start = offset;
@@ -620,6 +802,51 @@ static int quic_tls_parse_frames(quic_tls_conn_t *conn,
 
         if (quic_decode_varint(plaintext, plaintext_len, &offset, &frame_type) != 0) {
             return quic_tls_fail(conn, "failed to decode frame type");
+        }
+
+        if (frame_type >= 0x08 && frame_type <= 0x0f) {
+            uint64_t stream_id;
+            uint64_t stream_offset = 0;
+            uint64_t stream_len;
+            int has_offset = (frame_type & 0x04) != 0;
+            int has_length = (frame_type & 0x02) != 0;
+            int fin = (frame_type & 0x01) != 0;
+
+            if (level != ssl_encryption_application && level != ssl_encryption_early_data) {
+                return quic_tls_fail(conn, "stream frame received before application keys");
+            }
+            if (quic_decode_varint(plaintext, plaintext_len, &offset, &stream_id) != 0) {
+                return quic_tls_fail(conn, "invalid stream frame stream id");
+            }
+            if (has_offset && quic_decode_varint(plaintext, plaintext_len, &offset, &stream_offset) != 0) {
+                return quic_tls_fail(conn, "invalid stream frame offset");
+            }
+            if (has_length) {
+                if (quic_decode_varint(plaintext, plaintext_len, &offset, &stream_len) != 0 ||
+                    stream_len > plaintext_len - offset) {
+                    return quic_tls_fail(conn, "invalid stream frame length");
+                }
+            } else {
+                stream_len = plaintext_len - offset;
+            }
+            if (stream_offset > QUIC_STREAM_MAX_OFFSET ||
+                stream_len > QUIC_STREAM_MAX_OFFSET ||
+                stream_offset > QUIC_STREAM_MAX_OFFSET - stream_len) {
+                return quic_tls_fail(conn, "stream frame exceeded valid offset range");
+            }
+            if (quic_stream_map_on_stream(&conn->streams,
+                                          stream_id,
+                                          stream_offset,
+                                          plaintext + offset,
+                                          (size_t)stream_len,
+                                          fin,
+                                          conn->error_message,
+                                          sizeof(conn->error_message)) != 0) {
+                return -1;
+            }
+            offset += (size_t)stream_len;
+            *saw_ack_eliciting = 1;
+            continue;
         }
 
         switch (frame_type) {
@@ -694,8 +921,165 @@ static int quic_tls_parse_frames(quic_tls_conn_t *conn,
                 break;
             }
 
+            case QUIC_FRAME_RESET_STREAM: {
+                uint64_t stream_id;
+                uint64_t error_code;
+                uint64_t final_size;
+
+                if (level != ssl_encryption_application && level != ssl_encryption_early_data) {
+                    return quic_tls_fail(conn, "reset_stream received before application keys");
+                }
+                if (quic_decode_varint(plaintext, plaintext_len, &offset, &stream_id) != 0 ||
+                    quic_decode_varint(plaintext, plaintext_len, &offset, &error_code) != 0 ||
+                    quic_decode_varint(plaintext, plaintext_len, &offset, &final_size) != 0) {
+                    return quic_tls_fail(conn, "invalid reset_stream frame");
+                }
+                if (quic_stream_map_on_reset_stream(&conn->streams,
+                                                    stream_id,
+                                                    error_code,
+                                                    final_size,
+                                                    conn->error_message,
+                                                    sizeof(conn->error_message)) != 0) {
+                    return -1;
+                }
+                *saw_ack_eliciting = 1;
+                break;
+            }
+
+            case QUIC_FRAME_STOP_SENDING: {
+                uint64_t stream_id;
+                uint64_t error_code;
+
+                if (level != ssl_encryption_application && level != ssl_encryption_early_data) {
+                    return quic_tls_fail(conn, "stop_sending received before application keys");
+                }
+                if (quic_decode_varint(plaintext, plaintext_len, &offset, &stream_id) != 0 ||
+                    quic_decode_varint(plaintext, plaintext_len, &offset, &error_code) != 0) {
+                    return quic_tls_fail(conn, "invalid stop_sending frame");
+                }
+                if (quic_stream_map_on_stop_sending(&conn->streams,
+                                                    stream_id,
+                                                    error_code,
+                                                    conn->error_message,
+                                                    sizeof(conn->error_message)) != 0) {
+                    return -1;
+                }
+                *saw_ack_eliciting = 1;
+                break;
+            }
+
+            case QUIC_FRAME_MAX_DATA: {
+                uint64_t max_data;
+
+                if (quic_decode_varint(plaintext, plaintext_len, &offset, &max_data) != 0) {
+                    return quic_tls_fail(conn, "invalid max_data frame");
+                }
+                if (quic_stream_map_on_max_data(&conn->streams, max_data) != 0) {
+                    return quic_tls_fail(conn, "failed to apply max_data");
+                }
+                *saw_ack_eliciting = 1;
+                break;
+            }
+
+            case QUIC_FRAME_MAX_STREAM_DATA: {
+                uint64_t stream_id;
+                uint64_t max_data;
+
+                if (quic_decode_varint(plaintext, plaintext_len, &offset, &stream_id) != 0 ||
+                    quic_decode_varint(plaintext, plaintext_len, &offset, &max_data) != 0) {
+                    return quic_tls_fail(conn, "invalid max_stream_data frame");
+                }
+                if (quic_stream_map_on_max_stream_data(&conn->streams,
+                                                       stream_id,
+                                                       max_data,
+                                                       conn->error_message,
+                                                       sizeof(conn->error_message)) != 0) {
+                    return -1;
+                }
+                *saw_ack_eliciting = 1;
+                break;
+            }
+
+            case QUIC_FRAME_MAX_STREAMS_BIDI:
+            case QUIC_FRAME_MAX_STREAMS_UNI: {
+                uint64_t max_streams;
+
+                if (quic_decode_varint(plaintext, plaintext_len, &offset, &max_streams) != 0) {
+                    return quic_tls_fail(conn, "invalid max_streams frame");
+                }
+                if (quic_stream_map_on_max_streams(&conn->streams,
+                                                   frame_type == QUIC_FRAME_MAX_STREAMS_BIDI,
+                                                   max_streams) != 0) {
+                    return quic_tls_fail(conn, "failed to apply max_streams");
+                }
+                *saw_ack_eliciting = 1;
+                break;
+            }
+
+            case QUIC_FRAME_DATA_BLOCKED: {
+                uint64_t ignored;
+                if (quic_decode_varint(plaintext, plaintext_len, &offset, &ignored) != 0) {
+                    return quic_tls_fail(conn, "invalid data_blocked frame");
+                }
+                *saw_ack_eliciting = 1;
+                break;
+            }
+
+            case QUIC_FRAME_STREAM_DATA_BLOCKED: {
+                uint64_t stream_id;
+                uint64_t ignored;
+                if (quic_decode_varint(plaintext, plaintext_len, &offset, &stream_id) != 0 ||
+                    quic_decode_varint(plaintext, plaintext_len, &offset, &ignored) != 0) {
+                    return quic_tls_fail(conn, "invalid stream_data_blocked frame");
+                }
+                *saw_ack_eliciting = 1;
+                break;
+            }
+
+            case QUIC_FRAME_STREAMS_BLOCKED_BIDI:
+            case QUIC_FRAME_STREAMS_BLOCKED_UNI: {
+                uint64_t ignored;
+                if (quic_decode_varint(plaintext, plaintext_len, &offset, &ignored) != 0) {
+                    return quic_tls_fail(conn, "invalid streams_blocked frame");
+                }
+                *saw_ack_eliciting = 1;
+                break;
+            }
+
+            case QUIC_FRAME_CONNECTION_CLOSE_TRANSPORT: {
+                uint64_t error_code;
+                uint64_t ignored_frame_type;
+                uint64_t reason_len;
+
+                if (quic_decode_varint(plaintext, plaintext_len, &offset, &error_code) != 0 ||
+                    quic_decode_varint(plaintext, plaintext_len, &offset, &ignored_frame_type) != 0 ||
+                    quic_decode_varint(plaintext, plaintext_len, &offset, &reason_len) != 0 ||
+                    reason_len > plaintext_len - offset) {
+                    return quic_tls_fail(conn, "invalid transport connection_close frame");
+                }
+                conn->peer_close_error_code = error_code;
+                offset += (size_t)reason_len;
+                *received_connection_close = 1;
+                return quic_tls_on_peer_connection_close(conn);
+            }
+
+            case QUIC_FRAME_CONNECTION_CLOSE_APPLICATION: {
+                uint64_t error_code;
+                uint64_t reason_len;
+
+                if (quic_decode_varint(plaintext, plaintext_len, &offset, &error_code) != 0 ||
+                    quic_decode_varint(plaintext, plaintext_len, &offset, &reason_len) != 0 ||
+                    reason_len > plaintext_len - offset) {
+                    return quic_tls_fail(conn, "invalid application connection_close frame");
+                }
+                conn->peer_close_error_code = error_code;
+                offset += (size_t)reason_len;
+                *received_connection_close = 1;
+                return quic_tls_on_peer_connection_close(conn);
+            }
+
             default:
-                return quic_tls_fail(conn, "received unsupported frame during stage 2");
+                return quic_tls_fail(conn, "received unsupported frame during current stage");
         }
     }
 
@@ -943,6 +1327,169 @@ static int quic_tls_prepare_plan(quic_tls_conn_t *conn,
     return 0;
 }
 
+static enum ssl_encryption_level_t quic_tls_best_close_level(const quic_tls_conn_t *conn) {
+    if (!conn) {
+        return ssl_encryption_initial;
+    }
+    if (conn->conn.spaces[QUIC_PN_SPACE_APPLICATION].tx_keys_ready) {
+        return ssl_encryption_application;
+    }
+    if (conn->conn.spaces[QUIC_PN_SPACE_HANDSHAKE].tx_keys_ready) {
+        return ssl_encryption_handshake;
+    }
+    return ssl_encryption_initial;
+}
+
+static int quic_tls_encode_connection_close_transport(uint64_t error_code,
+                                                      uint8_t *plaintext,
+                                                      size_t plaintext_cap,
+                                                      size_t *plaintext_len) {
+    size_t offset = 0;
+
+    if (!plaintext || !plaintext_len || plaintext_cap == 0) {
+        return -1;
+    }
+
+    plaintext[offset++] = QUIC_FRAME_CONNECTION_CLOSE_TRANSPORT;
+    if (quic_tls_append_varint(error_code, plaintext, plaintext_cap, &offset) != 0 ||
+        quic_tls_append_varint(0, plaintext, plaintext_cap, &offset) != 0 ||
+        quic_tls_append_varint(0, plaintext, plaintext_cap, &offset) != 0) {
+        return -1;
+    }
+
+    *plaintext_len = offset;
+    return 0;
+}
+
+static int quic_tls_build_control_datagram_for_level(quic_tls_conn_t *conn,
+                                                     enum ssl_encryption_level_t level,
+                                                     const uint8_t *plaintext,
+                                                     size_t plaintext_len,
+                                                     uint8_t *out,
+                                                     size_t out_len,
+                                                     size_t *written) {
+    quic_conn_tx_plan_t plan;
+    quic_pn_space_id_t space = quic_tls_space_from_level(level);
+    uint8_t header[256];
+    size_t pn_offset;
+    size_t header_len;
+    size_t packet_len = 0;
+    uint64_t length_field;
+    quic_crypto_level_ctx_t *tx_ctx;
+    const uint8_t *initial_token = NULL;
+    size_t initial_token_len = 0;
+    uint8_t logical_packet_type;
+
+    if (!conn || !plaintext || !out || !written || space == QUIC_PN_SPACE_COUNT) {
+        return quic_tls_fail(conn, "invalid control packet build arguments");
+    }
+    if (quic_tls_prepare_plan(conn, space, 0, &plan) != 0) {
+        return -1;
+    }
+
+    if (level == ssl_encryption_application) {
+        if (quic_tls_encode_short_header(&conn->peer_cid,
+                                         plan.packet_number_len,
+                                         plan.packet_number,
+                                         header,
+                                         sizeof(header),
+                                         &pn_offset,
+                                         &header_len) != 0) {
+            return quic_tls_fail(conn, "failed to encode close short header");
+        }
+    } else {
+        if (level == ssl_encryption_initial) {
+            initial_token = conn->retry_token_len > 0 ? conn->retry_token : NULL;
+            initial_token_len = conn->retry_token_len;
+        }
+        logical_packet_type = level == ssl_encryption_initial ? 0 :
+                              (level == ssl_encryption_early_data ? 1 : 2);
+        length_field = plan.packet_number_len + plaintext_len + QUIC_AEAD_TAG_LEN;
+        if (quic_tls_encode_long_header(logical_packet_type,
+                                        &conn->peer_cid,
+                                        &conn->local_cid,
+                                        conn->version,
+                                        length_field,
+                                        initial_token,
+                                        initial_token_len,
+                                        plan.packet_number_len,
+                                        plan.packet_number,
+                                        header,
+                                        sizeof(header),
+                                        &pn_offset,
+                                        &header_len) != 0) {
+            return quic_tls_fail(conn, "failed to encode close long header");
+        }
+    }
+
+    tx_ctx = &conn->conn.spaces[space].tx_crypto;
+    if (quic_packet_protect(tx_ctx,
+                            plan.packet_number,
+                            header,
+                            header_len,
+                            pn_offset,
+                            plaintext,
+                            plaintext_len,
+                            out,
+                            out_len,
+                            &packet_len) != 0) {
+        return quic_tls_fail(conn, "failed to protect close packet");
+    }
+
+    *written = packet_len;
+    return 0;
+}
+
+static int quic_tls_prepare_connection_close(quic_tls_conn_t *conn,
+                                             uint64_t error_code,
+                                             int enter_draining_after_send) {
+    enum ssl_encryption_level_t level;
+    uint8_t plaintext[32];
+    size_t plaintext_len = 0;
+    size_t written = 0;
+
+    if (!conn) {
+        return quic_tls_fail(conn, "invalid close arguments");
+    }
+    if (conn->conn.state == QUIC_CONN_STATE_CLOSED) {
+        return 0;
+    }
+
+    level = quic_tls_best_close_level(conn);
+    if (!conn->conn.spaces[quic_tls_space_from_level(level)].tx_keys_ready) {
+        return quic_tls_fail(conn, "connection close keys unavailable");
+    }
+    if (!conn->peer_cid_known || conn->peer_cid.len == 0) {
+        return quic_tls_fail(conn, "connection close peer cid unavailable");
+    }
+    if (quic_tls_encode_connection_close_transport(error_code,
+                                                   plaintext,
+                                                   sizeof(plaintext),
+                                                   &plaintext_len) != 0) {
+        return quic_tls_fail(conn, "failed to encode connection close frame");
+    }
+    if (quic_tls_build_control_datagram_for_level(conn,
+                                                  level,
+                                                  plaintext,
+                                                  plaintext_len,
+                                                  conn->close_packet,
+                                                  sizeof(conn->close_packet),
+                                                  &written) != 0) {
+        return -1;
+    }
+
+    conn->close_packet_len = written;
+    conn->close_pending = 1;
+    conn->close_sent = 0;
+    conn->close_enter_draining_after_send = enter_draining_after_send ? 1 : 0;
+    conn->conn.state = QUIC_CONN_STATE_CLOSING;
+    if (conn->close_deadline_ms == 0) {
+        conn->close_deadline_ms = quic_tls_now_ms() + QUIC_TLS_CLOSE_TIMEOUT_MS;
+    }
+    quic_tls_arm_loss_timer(conn);
+    return 0;
+}
+
 static int quic_tls_append_ack_frame(quic_tls_conn_t *conn,
                                      enum ssl_encryption_level_t level,
                                      uint8_t *plaintext,
@@ -966,12 +1513,11 @@ static int quic_tls_append_ack_frame(quic_tls_conn_t *conn,
     if (space == QUIC_PN_SPACE_COUNT) {
         return quic_tls_fail(conn, "invalid ack level");
     }
-
-    memset(&ack, 0, sizeof(ack));
-    ack.largest_acked = conn->conn.spaces[space].largest_received_packet;
-    ack.ack_range_count = 1;
-    ack.ranges[0].largest = ack.largest_acked;
-    ack.ranges[0].smallest = 0;
+    if (quic_ack_frame_from_ranges(conn->conn.spaces[space].ack_ranges,
+                                   conn->conn.spaces[space].ack_range_count,
+                                   &ack) != 0) {
+        return quic_tls_fail(conn, "failed to build ack ranges");
+    }
 
     if (quic_ack_encode_frame(&ack, plaintext + *plaintext_len, plaintext_cap - *plaintext_len, &written) != 0) {
         return quic_tls_fail(conn, "failed to encode ack frame");
@@ -1033,6 +1579,195 @@ static int quic_tls_append_crypto_frame(quic_tls_conn_t *conn,
     return 0;
 }
 
+static int quic_tls_append_stream_control_frames(quic_tls_conn_t *conn,
+                                                 uint8_t *plaintext,
+                                                 size_t plaintext_cap,
+                                                 size_t *plaintext_len,
+                                                 int *ack_eliciting) {
+    size_t i;
+
+    if (!conn || !plaintext || !plaintext_len || !ack_eliciting) {
+        return quic_tls_fail(conn, "invalid stream control frame arguments");
+    }
+
+    if (conn->streams.max_data_pending) {
+        if (*plaintext_len + 1 + quic_tls_varint_len(conn->streams.max_data_to_send) > plaintext_cap) {
+            return quic_tls_fail(conn, "max_data does not fit");
+        }
+        plaintext[(*plaintext_len)++] = QUIC_FRAME_MAX_DATA;
+        if (quic_tls_append_varint(conn->streams.max_data_to_send, plaintext, plaintext_cap, plaintext_len) != 0) {
+            return quic_tls_fail(conn, "failed to encode max_data");
+        }
+        conn->streams.max_data_pending = 0;
+        conn->streams.max_data_in_flight = 1;
+        *ack_eliciting = 1;
+    }
+
+    if (conn->streams.max_streams_bidi_pending) {
+        if (*plaintext_len + 1 + quic_tls_varint_len(conn->streams.max_streams_bidi_to_send) > plaintext_cap) {
+            return quic_tls_fail(conn, "max_streams_bidi does not fit");
+        }
+        plaintext[(*plaintext_len)++] = QUIC_FRAME_MAX_STREAMS_BIDI;
+        if (quic_tls_append_varint(conn->streams.max_streams_bidi_to_send, plaintext, plaintext_cap, plaintext_len) != 0) {
+            return quic_tls_fail(conn, "failed to encode max_streams_bidi");
+        }
+        conn->streams.max_streams_bidi_pending = 0;
+        conn->streams.max_streams_bidi_in_flight = 1;
+        *ack_eliciting = 1;
+    }
+
+    if (conn->streams.max_streams_uni_pending) {
+        if (*plaintext_len + 1 + quic_tls_varint_len(conn->streams.max_streams_uni_to_send) > plaintext_cap) {
+            return quic_tls_fail(conn, "max_streams_uni does not fit");
+        }
+        plaintext[(*plaintext_len)++] = QUIC_FRAME_MAX_STREAMS_UNI;
+        if (quic_tls_append_varint(conn->streams.max_streams_uni_to_send, plaintext, plaintext_cap, plaintext_len) != 0) {
+            return quic_tls_fail(conn, "failed to encode max_streams_uni");
+        }
+        conn->streams.max_streams_uni_pending = 0;
+        conn->streams.max_streams_uni_in_flight = 1;
+        *ack_eliciting = 1;
+    }
+
+    for (i = 0; i < QUIC_STREAM_MAX_COUNT; i++) {
+        quic_stream_t *stream = &conn->streams.streams[i];
+
+        if (!stream->active) {
+            continue;
+        }
+
+        if (stream->stop_sending_pending) {
+            size_t needed = 1 + quic_tls_varint_len(stream->id) + quic_tls_varint_len(stream->stop_error_code);
+
+            if (*plaintext_len + needed > plaintext_cap) {
+                break;
+            }
+            plaintext[(*plaintext_len)++] = QUIC_FRAME_STOP_SENDING;
+            if (quic_tls_append_varint(stream->id, plaintext, plaintext_cap, plaintext_len) != 0 ||
+                quic_tls_append_varint(stream->stop_error_code, plaintext, plaintext_cap, plaintext_len) != 0) {
+                return quic_tls_fail(conn, "failed to encode stop_sending");
+            }
+            stream->stop_sending_pending = 0;
+            stream->stop_sending_in_flight = 1;
+            *ack_eliciting = 1;
+            break;
+        }
+
+        if (stream->reset_pending) {
+            uint64_t final_size = stream->send_final_size_known ? stream->send_final_size : stream->send_highest_offset;
+            size_t needed = 1 + quic_tls_varint_len(stream->id) +
+                            quic_tls_varint_len(stream->reset_error_code) +
+                            quic_tls_varint_len(final_size);
+
+            if (*plaintext_len + needed > plaintext_cap) {
+                break;
+            }
+            plaintext[(*plaintext_len)++] = QUIC_FRAME_RESET_STREAM;
+            if (quic_tls_append_varint(stream->id, plaintext, plaintext_cap, plaintext_len) != 0 ||
+                quic_tls_append_varint(stream->reset_error_code, plaintext, plaintext_cap, plaintext_len) != 0 ||
+                quic_tls_append_varint(final_size, plaintext, plaintext_cap, plaintext_len) != 0) {
+                return quic_tls_fail(conn, "failed to encode reset_stream");
+            }
+            stream->reset_pending = 0;
+            stream->reset_in_flight = 1;
+            *ack_eliciting = 1;
+            break;
+        }
+
+        if (stream->max_stream_data_pending) {
+            size_t needed = 1 + quic_tls_varint_len(stream->id) +
+                            quic_tls_varint_len(stream->max_stream_data_to_send);
+
+            if (*plaintext_len + needed > plaintext_cap) {
+                break;
+            }
+            plaintext[(*plaintext_len)++] = QUIC_FRAME_MAX_STREAM_DATA;
+            if (quic_tls_append_varint(stream->id, plaintext, plaintext_cap, plaintext_len) != 0 ||
+                quic_tls_append_varint(stream->max_stream_data_to_send, plaintext, plaintext_cap, plaintext_len) != 0) {
+                return quic_tls_fail(conn, "failed to encode max_stream_data");
+            }
+            stream->max_stream_data_pending = 0;
+            stream->max_stream_data_in_flight = 1;
+            *ack_eliciting = 1;
+            break;
+        }
+    }
+
+    return 0;
+}
+
+static int quic_tls_append_stream_frame(quic_tls_conn_t *conn,
+                                        uint8_t *plaintext,
+                                        size_t plaintext_cap,
+                                        size_t *plaintext_len,
+                                        int *ack_eliciting) {
+    quic_stream_t *stream = NULL;
+    size_t data_len = 0;
+    int fin_only = 0;
+    int fin = 0;
+    uint64_t offset;
+    size_t original_len;
+    size_t packet_payload_cap;
+
+    if (!conn || !plaintext || !plaintext_len || !ack_eliciting) {
+        return quic_tls_fail(conn, "invalid stream frame arguments");
+    }
+    if (quic_stream_map_prepare_stream_send(&conn->streams, &stream, &data_len, &fin_only) < 0) {
+        return quic_tls_fail(conn, "failed to select stream payload");
+    }
+    if (!stream) {
+        return 0;
+    }
+
+    offset = stream->sendbuf.send_offset;
+    original_len = data_len;
+    packet_payload_cap = plaintext_cap > QUIC_TLS_STREAM_PACKET_RESERVE
+                             ? plaintext_cap - QUIC_TLS_STREAM_PACKET_RESERVE
+                             : 0;
+    if (fin_only) {
+        fin = 1;
+    } else if (stream->fin_requested &&
+               !stream->fin_sent &&
+               stream->sendbuf.send_offset + data_len == stream->sendbuf.flight_end &&
+               stream->sendbuf.flight_end == stream->sendbuf.len) {
+        fin = 1;
+    }
+
+    for (;;) {
+        size_t needed = 1 + quic_tls_varint_len(stream->id) +
+                        quic_tls_varint_len(offset) +
+                        quic_tls_varint_len(data_len) +
+                        data_len;
+
+        if (*plaintext_len + needed <= packet_payload_cap) {
+            break;
+        }
+        if (data_len == 0) {
+            return quic_tls_fail(conn, "stream frame does not fit");
+        }
+        data_len--;
+        fin = 0;
+    }
+
+    plaintext[(*plaintext_len)++] = (uint8_t)(0x08 | 0x04 | 0x02 | (fin ? 0x01 : 0x00));
+    if (quic_tls_append_varint(stream->id, plaintext, plaintext_cap, plaintext_len) != 0 ||
+        quic_tls_append_varint(offset, plaintext, plaintext_cap, plaintext_len) != 0 ||
+        quic_tls_append_varint(data_len, plaintext, plaintext_cap, plaintext_len) != 0) {
+        return quic_tls_fail(conn, "failed to encode stream frame");
+    }
+    if (data_len > 0) {
+        memcpy(plaintext + *plaintext_len, stream->sendbuf.data + offset, data_len);
+        *plaintext_len += data_len;
+    }
+
+    quic_stream_map_note_stream_send(&conn->streams, stream, offset, data_len, fin);
+    if (data_len == 0 && !fin && original_len > 0) {
+        return quic_tls_fail(conn, "stream frame lost all payload");
+    }
+    *ack_eliciting = 1;
+    return 0;
+}
+
 static int quic_tls_build_payload_for_level(quic_tls_conn_t *conn,
                                             enum ssl_encryption_level_t level,
                                             uint8_t *plaintext,
@@ -1086,6 +1821,15 @@ static int quic_tls_build_payload_for_level(quic_tls_conn_t *conn,
         plaintext[offset++] = QUIC_FRAME_PING;
         *includes_ping = 1;
         *ack_eliciting = 1;
+    }
+
+    if (level == ssl_encryption_application) {
+        if (quic_tls_append_stream_control_frames(conn, plaintext, plaintext_cap, &offset, ack_eliciting) != 0) {
+            return -1;
+        }
+        if (quic_tls_append_stream_frame(conn, plaintext, plaintext_cap, &offset, ack_eliciting) != 0) {
+            return -1;
+        }
     }
 
     if (offset == 0) {
@@ -1214,7 +1958,7 @@ static int quic_tls_build_datagram_for_level(quic_tls_conn_t *conn,
     }
 
     if (quic_tls_server_amplification_limited(conn, packet_len)) {
-        return quic_tls_fail(conn, "server amplification limit reached");
+        return quic_tls_build_blocked(conn, written);
     }
 
     if (crypto_data_len > 0) {
@@ -1253,6 +1997,13 @@ void quic_tls_conn_init(quic_tls_conn_t *conn) {
 
     memset(conn, 0, sizeof(*conn));
     quic_conn_init(&conn->conn);
+    quic_stream_map_init(&conn->streams, 1);
+    conn->initial_max_data = 65536;
+    conn->initial_max_stream_data_bidi_local = 16384;
+    conn->initial_max_stream_data_bidi_remote = 16384;
+    conn->initial_max_stream_data_uni = 16384;
+    conn->initial_max_streams_bidi = 4;
+    conn->initial_max_streams_uni = 4;
     for (i = 0; i <= ssl_encryption_application; i++) {
         quic_crypto_recvbuf_init(&conn->levels[i].recv);
         quic_crypto_sendbuf_init(&conn->levels[i].send);
@@ -1279,6 +2030,7 @@ void quic_tls_conn_free(quic_tls_conn_t *conn) {
         quic_crypto_recvbuf_free(&conn->levels[i].recv);
         quic_crypto_sendbuf_free(&conn->levels[i].send);
     }
+    quic_stream_map_free(&conn->streams);
     for (i = 0; i < QUIC_PN_SPACE_COUNT; i++) {
         quic_queue_clear(&conn->conn.spaces[i].in_flight);
     }
@@ -1302,6 +2054,8 @@ int quic_tls_conn_configure(quic_tls_conn_t *conn,
         return quic_tls_fail(conn, "unsupported quic version");
     }
     conn->local_cid = *local_cid;
+    quic_stream_map_free(&conn->streams);
+    quic_stream_map_init(&conn->streams, role == QUIC_ROLE_CLIENT);
 
     if (peer_cid) {
         conn->peer_cid = *peer_cid;
@@ -1357,6 +2111,7 @@ int quic_tls_conn_configure(quic_tls_conn_t *conn,
         conn->initial_dcid = *peer_cid;
         conn->initial_dcid_known = 1;
         conn->peer_address_validated = 1;
+        conn->amplification_blocked = 0;
         if (quic_tls_install_initial_keys(conn) != 0) {
             return -1;
         }
@@ -1502,6 +2257,7 @@ static int quic_tls_server_maybe_require_retry(quic_tls_conn_t *conn,
         conn->original_dcid_known &&
         quic_tls_validate_retry_token(token, header->token_length, &conn->original_dcid)) {
         conn->peer_address_validated = 1;
+        conn->amplification_blocked = 0;
         return 0;
     }
 
@@ -1535,14 +2291,21 @@ int quic_tls_conn_handle_datagram(quic_tls_conn_t *conn, const uint8_t *packet, 
     quic_conn_pn_space_t *space;
     int fed_crypto = 0;
     int saw_ack_eliciting = 0;
+    int received_connection_close = 0;
 
     if (!conn || !packet || packet_len == 0 || packet_len > sizeof(packet_copy)) {
         return quic_tls_fail(conn, "invalid datagram input");
+    }
+    if (conn->conn.state == QUIC_CONN_STATE_CLOSED) {
+        return 0;
     }
     if (quic_parse_header_meta(packet, packet_len, &meta) != 0) {
         return quic_tls_fail(conn, "failed to parse datagram header");
     }
     quic_tls_note_packet_received(conn, packet_len);
+    if (conn->conn.state == QUIC_CONN_STATE_DRAINING) {
+        return 0;
+    }
 
     if (meta.header_form == 1 && meta.version != 0 && quic_version_get_ops(meta.version) == NULL) {
         if (conn->role == QUIC_ROLE_SERVER) {
@@ -1588,8 +2351,21 @@ int quic_tls_conn_handle_datagram(quic_tls_conn_t *conn, const uint8_t *packet, 
         }
     }
 
+    if (quic_tls_should_discard_without_processing(conn, &header)) {
+        return 0;
+    }
+
     space = &conn->conn.spaces[header.space];
     if (!space->rx_keys_ready) {
+        if (header.level == ssl_encryption_early_data ||
+            header.level == ssl_encryption_application) {
+            return 0;
+        }
+        // RFC 9000 5.2.1 / RFC 9001 4.1.4: a client may drop
+        // reordered Handshake packets until TLS provides the keys.
+        if (conn->role == QUIC_ROLE_CLIENT && header.space == QUIC_PN_SPACE_HANDSHAKE) {
+            return 0;
+        }
         if ((header.space == QUIC_PN_SPACE_INITIAL && conn->initial_keys_discarded) ||
             (header.space == QUIC_PN_SPACE_HANDSHAKE && conn->handshake_keys_discarded) ||
             conn->levels[header.level].discarded) {
@@ -1618,6 +2394,9 @@ int quic_tls_conn_handle_datagram(quic_tls_conn_t *conn, const uint8_t *packet, 
         return quic_tls_fail(conn, "failed to remove packet protection");
     }
 
+    if (quic_ack_note_received(space->ack_ranges, &space->ack_range_count, packet_number) != 0) {
+        return quic_tls_fail(conn, "failed to track received packet ranges");
+    }
     if (packet_number > space->largest_received_packet) {
         space->largest_received_packet = packet_number;
     }
@@ -1625,8 +2404,21 @@ int quic_tls_conn_handle_datagram(quic_tls_conn_t *conn, const uint8_t *packet, 
     conn->conn.last_recv_space = header.space;
     conn->conn.last_acked_packets = 0;
 
-    if (quic_tls_parse_frames(conn, header.level, plaintext, plaintext_len, &fed_crypto, &saw_ack_eliciting) != 0) {
+    if (quic_tls_parse_frames(conn,
+                              header.level,
+                              plaintext,
+                              plaintext_len,
+                              &fed_crypto,
+                              &saw_ack_eliciting,
+                              &received_connection_close) != 0) {
         return -1;
+    }
+    if (conn->conn.state == QUIC_CONN_STATE_CLOSING || conn->conn.state == QUIC_CONN_STATE_DRAINING) {
+        if (conn->conn.state == QUIC_CONN_STATE_CLOSING && !received_connection_close) {
+            conn->close_pending = 1;
+        }
+        quic_tls_arm_loss_timer(conn);
+        return 0;
     }
     if (saw_ack_eliciting) {
         quic_tls_mark_ack_pending(conn, header.level);
@@ -1636,11 +2428,13 @@ int quic_tls_conn_handle_datagram(quic_tls_conn_t *conn, const uint8_t *packet, 
         conn->received_handshake_packet = 1;
         if (conn->role == QUIC_ROLE_SERVER) {
             conn->peer_address_validated = 1;
+            conn->amplification_blocked = 0;
         }
     }
     if (header.space == QUIC_PN_SPACE_APPLICATION && header.level == ssl_encryption_application &&
         conn->role == QUIC_ROLE_SERVER) {
         conn->peer_address_validated = 1;
+        conn->amplification_blocked = 0;
     }
 
     if (fed_crypto) {
@@ -1668,13 +2462,43 @@ int quic_tls_conn_build_next_datagram(quic_tls_conn_t *conn, uint8_t *out, size_
     if (!conn || !out || !written) {
         return quic_tls_fail(conn, "invalid build_next_datagram arguments");
     }
+    if (conn->conn.state == QUIC_CONN_STATE_DRAINING || conn->conn.state == QUIC_CONN_STATE_CLOSED) {
+        return quic_tls_fail(conn, "connection is not allowed to send packets");
+    }
+    if (conn->role == QUIC_ROLE_SERVER &&
+        conn->amplification_blocked &&
+        !conn->peer_address_validated) {
+        *written = 0;
+        return QUIC_TLS_BUILD_BLOCKED;
+    }
+    if (conn->conn.state == QUIC_CONN_STATE_CLOSING) {
+        if (!conn->close_pending || conn->close_packet_len == 0) {
+            return quic_tls_fail(conn, "no connection close packet pending");
+        }
+        if (out_len < conn->close_packet_len) {
+            return quic_tls_fail(conn, "connection close output buffer too small");
+        }
+        if (quic_tls_server_amplification_limited(conn, conn->close_packet_len)) {
+            return quic_tls_build_blocked(conn, written);
+        }
+        memcpy(out, conn->close_packet, conn->close_packet_len);
+        *written = conn->close_packet_len;
+        conn->close_pending = 0;
+        conn->close_sent = 1;
+        if (conn->close_enter_draining_after_send) {
+            quic_tls_enter_draining(conn, conn->close_deadline_ms);
+        }
+        quic_tls_note_packet_sent(conn, *written);
+        quic_tls_arm_loss_timer(conn);
+        return 0;
+    }
 
     if (conn->special_packet_pending) {
         if (out_len < conn->special_packet_len) {
             return quic_tls_fail(conn, "special packet output buffer too small");
         }
         if (quic_tls_server_amplification_limited(conn, conn->special_packet_len)) {
-            return quic_tls_fail(conn, "server amplification limit reached");
+            return quic_tls_build_blocked(conn, written);
         }
         memcpy(out, conn->special_packet, conn->special_packet_len);
         *written = conn->special_packet_len;
@@ -1709,6 +2533,12 @@ int quic_tls_conn_has_pending_output(const quic_tls_conn_t *conn) {
     if (!conn) {
         return 0;
     }
+    if (conn->conn.state == QUIC_CONN_STATE_DRAINING || conn->conn.state == QUIC_CONN_STATE_CLOSED) {
+        return 0;
+    }
+    if (conn->conn.state == QUIC_CONN_STATE_CLOSING) {
+        return conn->close_pending && conn->close_packet_len > 0;
+    }
     return conn->special_packet_pending ||
            quic_tls_level_has_sendable_output(conn, ssl_encryption_initial) ||
            quic_tls_level_has_sendable_output(conn, ssl_encryption_early_data) ||
@@ -1725,6 +2555,18 @@ void quic_tls_conn_on_loss_timeout(quic_tls_conn_t *conn, uint64_t now_ms) {
     if (!conn) {
         return;
     }
+    if (quic_tls_close_state_active(conn)) {
+        if (conn->close_deadline_ms != 0 && now_ms >= conn->close_deadline_ms) {
+            conn->conn.state = QUIC_CONN_STATE_CLOSED;
+            conn->close_pending = 0;
+            conn->close_enter_draining_after_send = 0;
+            conn->close_deadline_ms = 0;
+            quic_conn_disarm_timer(&conn->conn, QUIC_CONN_TIMER_LOSS_DETECTION);
+        } else {
+            quic_tls_arm_loss_timer(conn);
+        }
+        return;
+    }
     if (quic_conn_on_timer(&conn->conn, QUIC_CONN_TIMER_LOSS_DETECTION, now_ms) != QUIC_CONN_OK) {
         return;
     }
@@ -1732,6 +2574,7 @@ void quic_tls_conn_on_loss_timeout(quic_tls_conn_t *conn, uint64_t now_ms) {
     for (i = 0; i <= ssl_encryption_application; i++) {
         quic_crypto_sendbuf_restart_flight(&conn->levels[i].send);
     }
+    quic_stream_map_restart_flights(&conn->streams);
     if (conn->handshake_done_in_flight) {
         conn->handshake_done_pending = 1;
     }
@@ -1755,6 +2598,120 @@ void quic_tls_conn_enable_retry(quic_tls_conn_t *conn, int enabled) {
     conn->retry_required = enabled ? 1 : 0;
 }
 
+void quic_tls_conn_set_initial_flow_control(quic_tls_conn_t *conn,
+                                            uint64_t max_data,
+                                            uint64_t max_stream_data_bidi_local,
+                                            uint64_t max_stream_data_bidi_remote,
+                                            uint64_t max_stream_data_uni,
+                                            uint64_t max_streams_bidi,
+                                            uint64_t max_streams_uni) {
+    if (!conn) {
+        return;
+    }
+    conn->initial_max_data = max_data;
+    conn->initial_max_stream_data_bidi_local = max_stream_data_bidi_local;
+    conn->initial_max_stream_data_bidi_remote = max_stream_data_bidi_remote;
+    conn->initial_max_stream_data_uni = max_stream_data_uni;
+    conn->initial_max_streams_bidi = max_streams_bidi;
+    conn->initial_max_streams_uni = max_streams_uni;
+}
+
+int quic_tls_conn_open_stream(quic_tls_conn_t *conn, int bidirectional, uint64_t *stream_id) {
+    if (!conn) {
+        return -1;
+    }
+    if (quic_stream_map_open(&conn->streams, bidirectional, stream_id) != 0) {
+        return quic_tls_fail(conn, "failed to open stream");
+    }
+    quic_tls_arm_loss_timer(conn);
+    return 0;
+}
+
+int quic_tls_conn_stream_write(quic_tls_conn_t *conn,
+                               uint64_t stream_id,
+                               const uint8_t *data,
+                               size_t len,
+                               int fin) {
+    if (!conn) {
+        return -1;
+    }
+    if (quic_stream_map_write(&conn->streams,
+                              stream_id,
+                              data,
+                              len,
+                              fin,
+                              conn->error_message,
+                              sizeof(conn->error_message)) != 0) {
+        return -1;
+    }
+    quic_tls_arm_loss_timer(conn);
+    return 0;
+}
+
+int quic_tls_conn_stream_read(quic_tls_conn_t *conn,
+                              uint64_t stream_id,
+                              uint8_t *out,
+                              size_t out_cap,
+                              size_t *out_read,
+                              int *out_fin) {
+    if (!conn) {
+        return -1;
+    }
+    if (quic_stream_map_read(&conn->streams,
+                             stream_id,
+                             out,
+                             out_cap,
+                             out_read,
+                             out_fin,
+                             conn->error_message,
+                             sizeof(conn->error_message)) != 0) {
+        return -1;
+    }
+    quic_tls_arm_loss_timer(conn);
+    return 0;
+}
+
+int quic_tls_conn_stream_peek(const quic_tls_conn_t *conn,
+                              uint64_t stream_id,
+                              size_t *available,
+                              int *fin,
+                              int *exists) {
+    if (!conn) {
+        return -1;
+    }
+    return quic_stream_map_peek(&conn->streams, stream_id, available, fin, exists);
+}
+
+int quic_tls_conn_stop_sending(quic_tls_conn_t *conn, uint64_t stream_id, uint64_t error_code) {
+    if (!conn) {
+        return -1;
+    }
+    if (quic_stream_map_stop_sending(&conn->streams,
+                                     stream_id,
+                                     error_code,
+                                     conn->error_message,
+                                     sizeof(conn->error_message)) != 0) {
+        return -1;
+    }
+    quic_tls_arm_loss_timer(conn);
+    return 0;
+}
+
+int quic_tls_conn_reset_stream(quic_tls_conn_t *conn, uint64_t stream_id, uint64_t error_code) {
+    if (!conn) {
+        return -1;
+    }
+    if (quic_stream_map_reset(&conn->streams,
+                              stream_id,
+                              error_code,
+                              conn->error_message,
+                              sizeof(conn->error_message)) != 0) {
+        return -1;
+    }
+    quic_tls_arm_loss_timer(conn);
+    return 0;
+}
+
 void quic_tls_conn_queue_ping(quic_tls_conn_t *conn) {
     if (!conn) {
         return;
@@ -1765,6 +2722,16 @@ void quic_tls_conn_queue_ping(quic_tls_conn_t *conn) {
 
 int quic_tls_conn_handshake_complete(const quic_tls_conn_t *conn) {
     return conn ? conn->handshake_complete : 0;
+}
+
+int quic_tls_conn_close(quic_tls_conn_t *conn, uint64_t transport_error_code) {
+    if (!conn) {
+        return -1;
+    }
+    if (quic_tls_close_state_active(conn) || conn->conn.state == QUIC_CONN_STATE_CLOSED) {
+        return 0;
+    }
+    return quic_tls_prepare_connection_close(conn, transport_error_code, 0);
 }
 
 const char *quic_tls_conn_last_error(const quic_tls_conn_t *conn) {

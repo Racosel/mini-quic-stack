@@ -6,8 +6,8 @@
 #include <stdio.h>
 #include <string.h>
 
-#define TEST_CERT_FILE "example/server_cert.pem"
-#define TEST_KEY_FILE  "example/server_key.pem"
+#define TEST_CERT_FILE "tests/certs/server_cert.pem"
+#define TEST_KEY_FILE  "tests/certs/server_key.pem"
 #define MAX_CAPTURED_PACKETS 32
 
 typedef struct {
@@ -304,6 +304,72 @@ static void test_stage1_tls_handshake(void) {
     quic_tls_conn_free(&server);
 }
 
+static void test_stage1_client_ignores_handshake_packets_before_keys(void) {
+    quic_tls_conn_t client;
+    quic_tls_conn_t server;
+    quic_cid_t client_scid = make_cid(0x20);
+    quic_cid_t client_odcid = make_cid(0xb0);
+    quic_cid_t server_scid = make_cid(0xc0);
+    captured_packet_t server_flight[MAX_CAPTURED_PACKETS];
+    size_t server_packet_count;
+    size_t i;
+    int saw_handshake = 0;
+
+    quic_tls_conn_init(&client);
+    quic_tls_conn_init(&server);
+
+    assert(quic_tls_conn_configure(&client,
+                                   QUIC_ROLE_CLIENT,
+                                   QUIC_V1_VERSION,
+                                   &client_scid,
+                                   &client_odcid,
+                                   NULL,
+                                   NULL) == 0);
+    assert(quic_tls_conn_configure(&server,
+                                   QUIC_ROLE_SERVER,
+                                   QUIC_V1_VERSION,
+                                   &server_scid,
+                                   NULL,
+                                   TEST_CERT_FILE,
+                                   TEST_KEY_FILE) == 0);
+    assert(quic_tls_conn_start(&client) == 0);
+    assert(flush_pending(&client, &server) == 1);
+
+    server_packet_count = capture_pending(&server, server_flight, MAX_CAPTURED_PACKETS);
+    assert(server_packet_count >= 2);
+    assert(!client.conn.spaces[QUIC_PN_SPACE_HANDSHAKE].rx_keys_ready);
+
+    for (i = 0; i < server_packet_count; i++) {
+        if (server_flight[i].space == QUIC_PN_SPACE_HANDSHAKE) {
+            assert(quic_tls_conn_handle_datagram(&client, server_flight[i].bytes, server_flight[i].len) == 0);
+            saw_handshake = 1;
+        }
+    }
+
+    assert(saw_handshake);
+    assert(!client.received_handshake_packet);
+    assert(!client.conn.spaces[QUIC_PN_SPACE_HANDSHAKE].rx_keys_ready);
+
+    for (i = 0; i < server_packet_count; i++) {
+        if (server_flight[i].space == QUIC_PN_SPACE_INITIAL) {
+            assert(quic_tls_conn_handle_datagram(&client, server_flight[i].bytes, server_flight[i].len) == 0);
+        }
+    }
+
+    assert(client.conn.spaces[QUIC_PN_SPACE_HANDSHAKE].rx_keys_ready);
+
+    for (i = 0; i < server_packet_count; i++) {
+        if (server_flight[i].space == QUIC_PN_SPACE_HANDSHAKE) {
+            assert(quic_tls_conn_handle_datagram(&client, server_flight[i].bytes, server_flight[i].len) == 0);
+        }
+    }
+
+    run_until(&client, &server, handshake_done);
+
+    quic_tls_conn_free(&client);
+    quic_tls_conn_free(&server);
+}
+
 static void test_stage1_application_retransmit(void) {
     quic_tls_conn_t client;
     quic_tls_conn_t server;
@@ -350,6 +416,7 @@ static void test_stage1_application_retransmit(void) {
 int main(void) {
     test_crypto_recvbuf_gap_tracking();
     test_stage1_tls_handshake();
+    test_stage1_client_ignores_handshake_packets_before_keys();
     test_stage1_application_retransmit();
     printf("Phase 12 tests passed.\n");
     return 0;

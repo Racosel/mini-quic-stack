@@ -46,7 +46,7 @@
   - `src/tls/quic_tls.c`
   - `include/quic_tls.h`
   - `tests/test_phase12.c`
-- `状态`: 已修复
+- `状态`: 已解决
 
 ## Bug 002：Stage 2 Version Negotiation 包 fixed bit 错误
 
@@ -69,7 +69,7 @@
 - `相关文件`:
   - `src/packet/quic_version.c`
   - `tests/test_phase13.c`
-- `状态`: 已修复
+- `状态`: 已解决
 
 ## Bug 003：Stage 2 交错时序下服务端错误重置 Initial 密钥
 
@@ -96,7 +96,7 @@
 - `相关文件`:
   - `src/tls/quic_tls.c`
   - `tests/test_phase13.c`
-- `状态`: 已修复
+- `状态`: 已解决
 
 ## Bug 004：Stage 2 example 在本端 PING 真正发出前提前退出
 
@@ -121,7 +121,7 @@
 - `相关文件`:
   - `example/server.c`
   - `example/client.c`
-- `状态`: 已修复
+- `状态`: 已解决
 
 ## Bug 005：Mininet 拓扑中的 HTB quantum warning
 
@@ -146,4 +146,114 @@
   - 运行层面的最终确认需要再次执行 `sudo python3 topo.py --auto` 检查 warning 是否消失
 - `相关文件`:
   - `topo.py`
-- `状态`: 已修复，用户已验证无报错
+- `状态`: 已解决，用户已验证无报错
+
+## Bug 006：Stage 3 本机回环下服务端示例过早退出
+
+- `时间`: 2026-03-17 16:09:44 +0800
+- `阶段`: 阶段 3 / example 本机 UDP 验证
+- `标题`: 服务端在客户端完成最终接收前退出，导致本机 UDP 客户端收到 `Connection refused`
+- `现象`:
+  - 阶段 3 首次本机回环验证时，服务端打印成功，但客户端在尾部 `recv()` 返回 `Connection refused`
+  - 同一轮运行中服务端已经完成握手、双流响应和 `PING` 交换，说明核心协议路径已通，但示例程序退出时序不稳
+- `影响`:
+  - `example/quic_server` / `example/quic_client` 无法稳定作为阶段 3 的本机自动验收入口
+  - 会造成“服务端成功、客户端失败”的假阴性结果，干扰后续 `topo.py --auto` 风险判断
+- `根因`:
+  - `example/server.c` 在“已收到客户端 `PING`、已发送完两个 stream 响应且当前无待发送数据”后立即退出
+  - 在本机 `127.0.0.1` 上，客户端仍可能处于接收尾包或发送最终 ACK 的窗口期；服务端过早关闭 UDP 端口后，客户端会收到内核返回的 `ECONNREFUSED`
+- `修复`:
+  - 为 `example/server.c` 增加 `SERVER_SHUTDOWN_GRACE_MS` 收尾宽限
+  - 当服务端达到“逻辑完成”条件后，不立即退出，而是继续保活并轮询一个短暂宽限窗口，给客户端完成尾部接收与 ACK 留出时间
+- `验证`:
+  - `make quic-server quic-client`
+  - 提权运行本机 UDP 回环验证，客户端与服务端都成功输出 `handshake complete, exchanged two bidirectional streams, and received encrypted ping`
+- `相关文件`:
+  - `example/server.c`
+- `状态`: 已解决
+
+## Bug 007：文件传输模式下大 STREAM 首包未给包头与 AEAD tag 预留空间
+
+- `时间`: 2026-03-17 16:24:08 +0800
+- `阶段`: 阶段 3 / 文件传输 example 与 `topo.py` 自动化
+- `标题`: 大文件首包在 `quic_packet_protect()` 前就把 datagram 填满，导致保护阶段失败
+- `现象`:
+  - 本机回环首次执行 `example/quic_client ... client_upload.bin client_downloaded.bin` 时，客户端报 `build packet failed: failed to protect packet`
+  - 服务端一直等不到完整流交换，最终超时
+- `影响`:
+  - 新增的文件上传/下载模式无法发送首个大 `STREAM` 数据包
+  - `topo.py --auto-file` 即使在具备 root 权限的环境下也会失败
+- `根因`:
+  - `src/tls/quic_tls.c` 中 `quic_tls_append_stream_frame()` 只按明文缓存 `plaintext_cap` 收缩 `STREAM` 数据长度
+  - 该逻辑没有为最终的 QUIC 包头和 AEAD tag 预留空间，导致明文虽然能放入 `plaintext[]`，但在 `quic_packet_protect()` 生成完整 QUIC 数据包时超出输出缓冲
+  - 这与 RFC 9000 第 14 节关于 UDP datagram size 约束一致：单个 QUIC 数据包必须完全落入可发送的 UDP payload 中
+- `修复`:
+  - 在 `quic_tls_append_stream_frame()` 中增加 `QUIC_TLS_STREAM_PACKET_RESERVE`
+  - 对大 `STREAM` 帧做分片时，不再把明文区域用满，而是固定给短头部和 AEAD tag 留出余量
+- `验证`:
+  - `make test14 quic-server quic-client`
+  - 提权运行本机 UDP 回环文件模式，client/server 均成功完成上传和下载，生成文件 hash 一致
+- `相关文件`:
+  - `src/tls/quic_tls.c`
+  - `example/client.c`
+  - `example/server.c`
+  - `topo.py`
+- `状态`: 已解决
+
+## Bug 008：`topo.py --auto-file` 的跨层耦合稳定性缺陷群
+
+- `时间`: 2026-03-17 16:41:05 +0800
+- `阶段`: 阶段 2 / 阶段 3 / `topo.py --auto-file`
+- `标题`: 这不是单点缺陷，而是握手、收发、流状态机、自动化脚本和关闭路径共同触发的跨层耦合问题
+- `现象`:
+  - 自动化文件传输验证在 Mininet 上曾出现多种低概率失败形态，包括 `client send: Connection refused`、`timeout waiting for QUIC stream exchange`、`stream receive side is closed`、`server amplification limit reached`、以及客户端 `receive keys unavailable for packet level: role=0 space=1`
+  - 失败触发点分布在连接收尾、启动竞态、丢包乱序、提前到达的加密级别数据包、以及地址验证受限阶段
+  - 症状表面上分散，但都集中暴露在 `make topo-auto-file` 这个高噪声、跨层路径上
+- `影响`:
+  - `topo.py --auto-file` 一度无法作为稳定验收入口
+  - 多个表面不相关的故障会互相掩盖，容易把“脚本时序问题”误判成“协议错误”，或把“协议错误”误判成“环境噪声”
+- `主根因`:
+  - 这是一个跨层耦合缺陷群，不是单个点状 bug。核心问题集中在以下 7 类：
+  - 连接收尾语义不合规：缺少显式应用完成信号，错误依赖经验性宽限时间，而不是 `CONNECTION_CLOSE` 的 `closing` / `draining` 路径
+  - 自动化脚本时序不稳：`topo.py` 早期依赖固定等待时间启动客户端，放大了服务端监听就绪与 ARP 解析竞态
+  - ACK 语义错误：ACK Range 未保留缺口，导致丢包后对端错误认为数据已被确认
+  - 发送流状态机错误：`STREAM + FIN` 后过早禁止旧数据重传，不符合 RFC 9000 的 `Data Sent` 语义
+  - 接收流终态错误：流已完整接收后对合法重传仍报错，而不是丢弃
+  - 加密级别乱序处理错误：应用空间和 Handshake 空间在读密钥未就绪时被错误升级成连接错误，而不是忽略或延后处理
+  - anti-amplification 语义错误：服务端把“暂时不能继续发”实现成了致命构包失败，并错误保持 PTO/loss timer 活跃
+- `修复`:
+  - 连接关闭与应用完成：
+  - 在 `example/client.c` / `example/server.c` 中增加显式 `APP_COMPLETE` / `APP_COMPLETE_ACK`
+  - 实现 `CONNECTION_CLOSE(NO_ERROR)`、`closing` / `draining`、有界关闭计时
+  - 自动化脚本：
+  - `topo.py` 改为等待 `server listening` 就绪标记
+  - 增加双向 `ping` 预热
+  - 自动清理测试产物并恢复 `tests/` 目录所有权
+  - 协议收发与状态机：
+  - 为各包号空间补齐 ACK Range 跟踪与编码
+  - 修正 `FIN` 后的发送侧重传语义
+  - 修正终态流对合法重传的处理
+  - 在应用读密钥未就绪、客户端 Handshake 读密钥未就绪时改为丢弃而非报错
+  - 将 anti-amplification 实现为可恢复的阻塞态，而不是致命错误
+  - 回归测试：
+  - `tests/test_phase12.c` 增加客户端先收到 Handshake 包的乱序回归
+  - `tests/test_phase13.c` 增加 anti-amplification 阻塞/解阻塞回归，以及应用读密钥未就绪回归
+  - `tests/test_phase14.c` 增加 ACK Range、终态重传、关闭路径等回归
+- `验证`:
+  - `make test12 test13 test14` 均按默认 5 轮通过
+  - 本机提权 UDP 文件传输回环多轮通过，上传/下载文件 SHA-256 一致
+  - 用户在 Mininet 上执行 `make topo-auto-file` 共 30 次，均成功
+- `相关文件`:
+  - `src/tls/quic_tls.c`
+  - `src/transport/quic_stream.c`
+  - `src/recovery/quic_ack.c`
+  - `example/client.c`
+  - `example/server.c`
+  - `tests/test_phase12.c`
+  - `tests/test_phase13.c`
+  - `tests/test_phase14.c`
+  - `topo.py`
+- `后续风险`:
+  - 该缺陷群改动面跨越 TLS、包收发、流状态机、example 和自动化脚本，后续在这些区域继续开发时，仍可能出现新的耦合回归
+  - 以后凡是修改上述文件或相邻路径，都不能只跑单点单测，至少要重新执行 `make test12 test13 test14`、本机文件传输回环，以及 `make topo-auto-file`
+- `状态`: 已解决，用户已完成 30 次拓扑复验

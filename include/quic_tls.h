@@ -3,6 +3,7 @@
 
 #include "quic_connection.h"
 #include "quic_crypto_stream.h"
+#include "quic_stream.h"
 #include "quic_transport_params.h"
 #include <openssl/ssl.h>
 
@@ -10,6 +11,8 @@
 #define QUIC_TLS_MAX_DATAGRAM_SIZE 1400
 #define QUIC_TLS_MAX_RETRY_TOKEN 256
 #define QUIC_TLS_RETRANSMIT_TIMEOUT_MS 200
+#define QUIC_TRANSPORT_ERROR_NO_ERROR 0x00
+#define QUIC_TLS_BUILD_BLOCKED 1
 
 typedef enum {
     QUIC_ROLE_CLIENT = 0,
@@ -42,6 +45,7 @@ typedef struct {
     quic_tls_crypto_level_t levels[ssl_encryption_application + 1];
     quic_transport_params_t local_transport_params;
     quic_transport_params_t peer_transport_params;
+    quic_stream_map_t streams;
     uint8_t local_transport_params_bytes[QUIC_TLS_MAX_TRANSPORT_PARAMS];
     size_t local_transport_params_len;
     uint8_t peer_transport_params_bytes[QUIC_TLS_MAX_TRANSPORT_PARAMS];
@@ -62,7 +66,12 @@ typedef struct {
     uint8_t ping_pending;
     uint8_t ping_in_flight;
     uint8_t ping_received;
+    uint8_t close_pending;
+    uint8_t close_enter_draining_after_send;
+    uint8_t close_received;
+    uint8_t close_sent;
     uint8_t peer_address_validated;
+    uint8_t amplification_blocked;
     uint8_t special_packet_pending;
     uint8_t last_alert_level;
     uint8_t last_alert;
@@ -70,8 +79,18 @@ typedef struct {
     size_t retry_token_len;
     uint8_t special_packet[QUIC_TLS_MAX_DATAGRAM_SIZE];
     size_t special_packet_len;
+    uint8_t close_packet[QUIC_TLS_MAX_DATAGRAM_SIZE];
+    size_t close_packet_len;
     uint64_t bytes_received;
     uint64_t bytes_sent;
+    uint64_t close_deadline_ms;
+    uint64_t peer_close_error_code;
+    uint64_t initial_max_data;
+    uint64_t initial_max_stream_data_bidi_local;
+    uint64_t initial_max_stream_data_bidi_remote;
+    uint64_t initial_max_stream_data_uni;
+    uint64_t initial_max_streams_bidi;
+    uint64_t initial_max_streams_uni;
     char error_message[256];
 } quic_tls_conn_t;
 
@@ -93,7 +112,34 @@ int quic_tls_conn_has_pending_output(const quic_tls_conn_t *conn);
 void quic_tls_conn_on_loss_timeout(quic_tls_conn_t *conn, uint64_t now_ms);
 uint64_t quic_tls_conn_loss_deadline_ms(const quic_tls_conn_t *conn);
 void quic_tls_conn_enable_retry(quic_tls_conn_t *conn, int enabled);
+void quic_tls_conn_set_initial_flow_control(quic_tls_conn_t *conn,
+                                            uint64_t max_data,
+                                            uint64_t max_stream_data_bidi_local,
+                                            uint64_t max_stream_data_bidi_remote,
+                                            uint64_t max_stream_data_uni,
+                                            uint64_t max_streams_bidi,
+                                            uint64_t max_streams_uni);
+int quic_tls_conn_open_stream(quic_tls_conn_t *conn, int bidirectional, uint64_t *stream_id);
+int quic_tls_conn_stream_write(quic_tls_conn_t *conn,
+                               uint64_t stream_id,
+                               const uint8_t *data,
+                               size_t len,
+                               int fin);
+int quic_tls_conn_stream_read(quic_tls_conn_t *conn,
+                              uint64_t stream_id,
+                              uint8_t *out,
+                              size_t out_cap,
+                              size_t *out_read,
+                              int *out_fin);
+int quic_tls_conn_stream_peek(const quic_tls_conn_t *conn,
+                              uint64_t stream_id,
+                              size_t *available,
+                              int *fin,
+                              int *exists);
+int quic_tls_conn_stop_sending(quic_tls_conn_t *conn, uint64_t stream_id, uint64_t error_code);
+int quic_tls_conn_reset_stream(quic_tls_conn_t *conn, uint64_t stream_id, uint64_t error_code);
 void quic_tls_conn_queue_ping(quic_tls_conn_t *conn);
+int quic_tls_conn_close(quic_tls_conn_t *conn, uint64_t transport_error_code);
 int quic_tls_conn_handshake_complete(const quic_tls_conn_t *conn);
 const char *quic_tls_conn_last_error(const quic_tls_conn_t *conn);
 

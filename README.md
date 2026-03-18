@@ -1,6 +1,6 @@
 # AI-QUIC
 
-`AI-QUIC` 是一个面向学习和分阶段实现的 QUIC 协议实验仓库。当前代码已经完成阶段 0、阶段 1 和阶段 2：除 QUIC v1/v2 的报文解析、Initial 密钥派生、Initial 报文保护/解保护、传输参数处理、最小化 ACK 与在途包管理外，还补上了基于 BoringSSL 的 TLS 1.3 QUIC 回调层、CRYPTO 数据重组、transport parameters 注入与解析、Handshake/0-RTT/1-RTT/短头包的真实收发、ACK 生成、Version Negotiation/Retry 运行时处理，以及服务端放大攻击限制。项目仍然不是完整的 QUIC 协议栈，更接近“协议构件验证平台”。
+`AI-QUIC` 是一个面向学习和分阶段实现的 QUIC 协议实验仓库。当前代码已经完成阶段 0、阶段 1、阶段 2 和阶段 3：除 QUIC v1/v2 的报文解析、Initial 密钥派生、Initial 报文保护/解保护、传输参数处理、最小化 ACK 与在途包管理外，还补上了基于 BoringSSL 的 TLS 1.3 QUIC 回调层、CRYPTO 数据重组、transport parameters 注入与解析、Handshake/0-RTT/1-RTT/短头包的真实收发、ACK 生成、Version Negotiation/Retry 运行时处理、服务端放大攻击限制，以及多流状态管理与基础流控。项目仍然不是完整的 QUIC 协议栈，更接近“协议构件验证平台”。
 
 ## 参考标准
 
@@ -20,7 +20,7 @@
 - `src/tls/`: BoringSSL QUIC/TLS 适配层与握手驱动
 - `src/frame/`: 帧级别的通用语法解析
 - `src/recovery/`: ACK 解析与最小在途包管理
-- `src/transport/`: UDP 批量接收、连接骨架与 CRYPTO 缓冲
+- `src/transport/`: UDP 批量接收、连接骨架、CRYPTO 缓冲与流状态管理
 - `example/`: 基于 UDP 的最小 QUIC server/client 示例
 - `tests/`: 分阶段测试
 
@@ -36,6 +36,7 @@
 6. 在阶段 0 中将连接层重构为统一骨架：引入连接状态机、三类包号空间、统一收包分发、统一发包计划入口，以及统一定时器/事件处理接口。
 7. 在阶段 1 中接入 BoringSSL 的 `SSL_QUIC_METHOD`，实现 CRYPTO 数据重组、transport parameters 注入/解析、Handshake 与 1-RTT 密钥安装、握手 flight 定时重传，以及最小化的短头包 PING 验证路径。
 8. 在阶段 2 中补齐最小可运行的包收发管线：Initial、Handshake、0-RTT、1-RTT、短头包的解析与构造，ACK 自动生成，Version Negotiation 与 Retry 串接，服务端放大攻击限制，以及真实 UDP 示例上的 1-RTT 加密收发。
+9. 在阶段 3 中补齐 stream 状态机、发送缓冲、接收重组、FIN/RESET/STOP_SENDING、MAX_DATA/MAX_STREAM_DATA/MAX_STREAMS enforcement，以及基本多流调度器；当前 `example/` 已能在两个双向流上完成双向数据交换。
 
 ## 功能审计结果
 
@@ -63,14 +64,15 @@
 | 连接基础骨架 | 显式状态机、三类包号空间、统一收包/发包骨架、统一定时器与事件入口 | RFC 9000, RFC 9002 | `src/transport/quic_connection.c` | `tests/test_phase11.c` |
 | TLS 1.3 QUIC 握手核心 | BoringSSL QUIC 回调、CRYPTO 重组、transport parameters 注入/解析、Handshake/1-RTT 密钥安装与旧密钥丢弃 | RFC 9001 | `src/tls/quic_tls.c`, `src/transport/quic_crypto_stream.c` | `tests/test_phase12.c` |
 | 阶段 2 包收发管线 | Handshake、0-RTT、1-RTT、短头包的解析/构造，ACK 生成，Version Negotiation，Retry，服务端放大攻击限制 | RFC 9000, RFC 9001, RFC 9002, RFC 9369 | `src/tls/quic_tls.c`, `src/packet/quic_version.c`, `src/packet/quic_retry.c` | `tests/test_phase13.c` |
-| 最小端到端握手示例 | UDP server/client 建立加密 QUIC 连接、交换 1-RTT PING | RFC 9000, RFC 9001 | `example/server.c`, `example/client.c`, `topo.py` | `tests/test_phase12.c`, `tests/test_phase13.c`, `make quic-demo` |
+| 阶段 3 流与流控基础 | stream 状态机、发送缓冲、接收重组、FIN/RESET/STOP_SENDING、MAX_DATA/MAX_STREAM_DATA/MAX_STREAMS enforcement、基本调度器 | RFC 9000 | `src/transport/quic_stream.c`, `src/tls/quic_tls.c` | `tests/test_phase14.c` |
+| 最小端到端多流示例 | UDP server/client 建立加密 QUIC 连接、在两个 bidirectional stream 上双向收发应用数据，并交换 1-RTT PING | RFC 9000, RFC 9001 | `example/server.c`, `example/client.c`, `topo.py` | `tests/test_phase12.c`, `tests/test_phase13.c`, `tests/test_phase14.c`, `make quic-demo` |
 
 ### 部分实现功能
 
 以下能力已有“骨架”或“语法层支持”，但与 RFC 的完整要求相比仍不完整。
 
 - 帧处理目前主要是“可遍历、可跳过、可抽取少量关键字段”，并未对大多数帧建立完整状态机或副作用。
-- `quic_conn_recv_initial()` 与 `quic_tls_conn_handle_datagram()` 已能处理 ACK、CRYPTO、PING、HANDSHAKE_DONE、NEW_TOKEN 等少量关键帧，但没有对各包级别的合法帧集合做完整约束，也没有接入 stream/data/control 全状态机。
+- `quic_conn_recv_initial()` 与 `quic_tls_conn_handle_datagram()` 已能处理 ACK、CRYPTO、PING、HANDSHAKE_DONE、NEW_TOKEN、STREAM、RESET_STREAM、STOP_SENDING、MAX_DATA、MAX_STREAM_DATA、MAX_STREAMS 等关键帧，但没有对各包级别的合法帧集合做完整约束，也没有接入 blocked/path/CID 管理等剩余控制帧状态机。
 - 传输参数虽然支持编解码多个标准字段，但缺少默认值补齐、语义合法性校验和跨字段约束检查。
 - Version Negotiation 与 Retry 已串进真实收发流程，但仍缺少降级防护、兼容版本协商和更完整的 token/地址验证策略。
 - 0-RTT 已具备包级解析/构造路径，但仍未接入真实应用数据、重放风险约束和会话票据语义。
@@ -80,8 +82,6 @@
 
 与 RFC 9000/9001/9002/9369 相比，当前仓库明显缺失以下核心能力：
 
-- 流管理、流状态机、重组、发送调度与流量控制
-- 连接级流量控制、最大数据量与 stream limit enforcement
 - 连接迁移、路径验证、CID 生命周期管理与 NEW_CONNECTION_ID 语义执行
 - Stateless Reset 构造与处理
 - 丢包检测、RTT 估计、PTO、NewReno 拥塞控制等 RFC 9002 主体逻辑
@@ -106,6 +106,7 @@
 - `test11`: 阶段 0 连接骨架，覆盖状态机、包号空间、统一收包/发包入口与定时器事件入口
 - `test12`: 阶段 1 TLS/QUIC 握手核心，覆盖 CRYPTO 重组、transport parameters、Handshake/1-RTT 密钥安装、旧密钥丢弃与内存内端到端握手
 - `test13`: 阶段 2 完整包收发管线，覆盖 ACK 生成、交错时序下的后续 Initial、Retry、Version Negotiation、放大攻击限制、0-RTT 与短头包路径
+- `test14`: 阶段 3 流与流控基础，覆盖多流双向数据传输、MAX_DATA/MAX_STREAM_DATA 增长，以及 STOP_SENDING 触发 RESET_STREAM
 
 运行方式：
 
@@ -123,6 +124,7 @@ make test10
 make test11
 make test12
 make test13
+make test14
 ```
 
 或直接编译全部当前测试目标：
@@ -140,8 +142,8 @@ make quic-demo
 本机回环验证可以直接运行：
 
 ```bash
-./example/quic_server 127.0.0.1 4434
-./example/quic_client 127.0.0.1 4434
+./tests/bin/quic_server 127.0.0.1 4434 tests/certs/server_cert.pem tests/certs/server_key.pem
+./tests/bin/quic_client 127.0.0.1 4434
 ```
 
 如果本机具备 root 权限并已安装 Mininet，可以直接在拓扑上自动验证：
@@ -149,6 +151,21 @@ make quic-demo
 ```bash
 make topo-auto
 ```
+
+`topo-auto` 与 `topo-auto-file` 默认都会重复执行 5 轮；只有全部轮次都通过，目标才算成功。
+
+如果要在拓扑中验证真实文件上传/下载，可以运行：
+
+```bash
+make topo-auto-file
+```
+
+该模式会在 `tests/data/topo-transfer/` 下生成和校验以下文件：
+
+- `client_upload.bin`: 客户端上传源文件
+- `server_received.bin`: 服务端接收后的文件
+- `server_source.bin`: 服务端下发源文件
+- `client_downloaded.bin`: 客户端下载后的文件
 
 ## 当前定位
 
@@ -162,7 +179,7 @@ make topo-auto
 
 阶段 2：已完成完整包收发管线。当前已实现 Handshake、0-RTT、1-RTT、短头包的真实解析和构造；补齐 ACK 生成、包构造、包号分配、包保护/解保护在各密钥级别上的切换；并把 Version Negotiation、Retry、放大攻击限制串进真实收发流程。内存内回归和本机 UDP `example/` 均已证明两端可以建立连接并发送 1-RTT 数据包。
 
-阶段 3：实现流与连接级流控。这里要补 stream 状态机、发送缓冲、接收重组、FIN/RESET/STOP_SENDING、MAX_DATA/MAX_STREAM_DATA/MAX_STREAMS 的 enforcement，以及基本调度器。完成标志是能在多个流上稳定双向传输数据，并正确触发流控帧。
+阶段 3：已完成流与连接级流控基础。当前已实现 stream 状态机、发送缓冲、接收重组、FIN/RESET/STOP_SENDING、MAX_DATA/MAX_STREAM_DATA/MAX_STREAMS 的 enforcement，以及基本调度器。`tests/test_phase14.c` 和本机 UDP `example/` 已证明双方能在多个双向流上稳定传输数据，并能触发和消费流控更新帧。
 
 阶段 4：实现 RFC 9002 的恢复与拥塞控制主体。要把现在的极简 in-flight bookkeeping 扩展成完整 sent-packet map、RTT 估计、ack delay 处理、loss detection、PTO、拥塞窗口、慢启动/拥塞避免、ECN 验证。完成标志是出现丢包、乱序、重传和超时时，连接仍能收敛并继续传输。
 
