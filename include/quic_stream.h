@@ -6,6 +6,12 @@
 #include <stdint.h>
 
 #define QUIC_STREAM_MAX_COUNT 32
+#define QUIC_STREAM_MAX_RETRANSMIT_RANGES 32
+
+typedef struct {
+    uint64_t start;
+    uint64_t end;
+} quic_stream_send_range_t;
 
 typedef struct {
     uint8_t active;
@@ -40,6 +46,8 @@ typedef struct {
     uint64_t stop_error_code;
     uint64_t reset_error_code;
     uint64_t max_stream_data_to_send;
+    quic_stream_send_range_t retransmit_ranges[QUIC_STREAM_MAX_RETRANSMIT_RANGES];
+    size_t retransmit_range_count;
     quic_crypto_sendbuf_t sendbuf;
     quic_crypto_recvbuf_t recvbuf;
 } quic_stream_t;
@@ -163,15 +171,28 @@ int quic_stream_map_on_max_stream_data(quic_stream_map_t *map,
 int quic_stream_map_on_max_streams(quic_stream_map_t *map, int bidirectional, uint64_t max_streams);
 
 int quic_stream_map_has_pending_output(const quic_stream_map_t *map);
+int quic_stream_map_has_buffered_send_data(const quic_stream_map_t *map);
+int quic_stream_map_is_flow_control_limited(const quic_stream_map_t *map);
 int quic_stream_map_prepare_stream_send(quic_stream_map_t *map,
                                         quic_stream_t **out_stream,
+                                        uint64_t *out_offset,
                                         size_t *out_len,
-                                        int *out_fin_only);
+                                        int *out_fin_only,
+                                        int *out_is_retransmit);
 void quic_stream_map_note_stream_send(quic_stream_map_t *map,
                                       quic_stream_t *stream,
                                       uint64_t offset,
                                       size_t len,
-                                      int fin);
+                                      int fin,
+                                      int is_retransmit);
+void quic_stream_map_on_stream_acked(quic_stream_map_t *map,
+                                     uint64_t stream_id,
+                                     uint64_t offset,
+                                     size_t len);
+void quic_stream_map_on_stream_lost(quic_stream_map_t *map,
+                                    uint64_t stream_id,
+                                    uint64_t offset,
+                                    size_t len);
 void quic_stream_map_restart_flights(quic_stream_map_t *map);
 
 #endif // QUIC_STREAM_H

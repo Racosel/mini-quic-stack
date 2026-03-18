@@ -39,6 +39,9 @@ SRC_TEST_PHASE11 = tests/test_phase11.c
 SRC_TEST_PHASE12 = tests/test_phase12.c
 SRC_TEST_PHASE13 = tests/test_phase13.c
 SRC_TEST_PHASE14 = tests/test_phase14.c
+SRC_TEST_PHASE15 = tests/test_phase15.c
+SRC_TEST_PHASE16 = tests/test_phase16.c
+SRC_TEST_PHASE17 = tests/test_phase17.c
 
 BIN_TEST_PHASE1 = $(TEST_BIN_DIR)/test_phase1_bin
 BIN_TEST_PHASE2 = $(TEST_BIN_DIR)/test_phase2_bin
@@ -53,16 +56,19 @@ BIN_TEST_PHASE11 = $(TEST_BIN_DIR)/test_phase11_bin
 BIN_TEST_PHASE12 = $(TEST_BIN_DIR)/test_phase12_bin
 BIN_TEST_PHASE13 = $(TEST_BIN_DIR)/test_phase13_bin
 BIN_TEST_PHASE14 = $(TEST_BIN_DIR)/test_phase14_bin
+BIN_TEST_PHASE15 = $(TEST_BIN_DIR)/test_phase15_bin
+BIN_TEST_PHASE16 = $(TEST_BIN_DIR)/test_phase16_bin
+BIN_TEST_PHASE17 = $(TEST_BIN_DIR)/test_phase17_bin
 BIN_EXAMPLE_SERVER = $(TEST_BIN_DIR)/quic_server
 BIN_EXAMPLE_CLIENT = $(TEST_BIN_DIR)/quic_client
 TEST_CERT = $(TEST_CERT_DIR)/server_cert.pem
 TEST_KEY = $(TEST_CERT_DIR)/server_key.pem
-BIN_TESTS = $(BIN_TEST_PHASE1) $(BIN_TEST_PHASE2) $(BIN_TEST_PHASE3) $(BIN_TEST_PHASE4) $(BIN_TEST_PHASE6) $(BIN_TEST_PHASE7) $(BIN_TEST_PHASE8) $(BIN_TEST_PHASE9) $(BIN_TEST_PHASE10) $(BIN_TEST_PHASE11) $(BIN_TEST_PHASE12) $(BIN_TEST_PHASE13) $(BIN_TEST_PHASE14)
+BIN_TESTS = $(BIN_TEST_PHASE1) $(BIN_TEST_PHASE2) $(BIN_TEST_PHASE3) $(BIN_TEST_PHASE4) $(BIN_TEST_PHASE6) $(BIN_TEST_PHASE7) $(BIN_TEST_PHASE8) $(BIN_TEST_PHASE9) $(BIN_TEST_PHASE10) $(BIN_TEST_PHASE11) $(BIN_TEST_PHASE12) $(BIN_TEST_PHASE13) $(BIN_TEST_PHASE14) $(BIN_TEST_PHASE15) $(BIN_TEST_PHASE16) $(BIN_TEST_PHASE17)
 
 
-.PHONY: all test1 test2 test3 test4 test5_1 test6 test7 test8 test9 test10 test11 test12 test13 test14 example-certs quic-server quic-client quic-demo topo-auto topo-auto-file clean net
+.PHONY: all test1 test2 test3 test4 test5_1 test6 test7 test8 test9 test10 test11 test12 test13 test14 test15 test16 test17 example-certs quic-server quic-client quic-demo topo-auto topo-auto-file topo-stage4-clean topo-stage4-lossy clean net
 
-all: $(BIN_TEST_PHASE1) $(BIN_TEST_PHASE2) $(BIN_TEST_PHASE3) $(BIN_TEST_PHASE4) $(BIN_TEST_PHASE6) $(BIN_TEST_PHASE7) $(BIN_TEST_PHASE8) $(BIN_TEST_PHASE9) $(BIN_TEST_PHASE10) $(BIN_TEST_PHASE11) $(BIN_TEST_PHASE12) $(BIN_TEST_PHASE13) $(BIN_TEST_PHASE14) $(BIN_EXAMPLE_SERVER) $(BIN_EXAMPLE_CLIENT)
+all: $(BIN_TEST_PHASE1) $(BIN_TEST_PHASE2) $(BIN_TEST_PHASE3) $(BIN_TEST_PHASE4) $(BIN_TEST_PHASE6) $(BIN_TEST_PHASE7) $(BIN_TEST_PHASE8) $(BIN_TEST_PHASE9) $(BIN_TEST_PHASE10) $(BIN_TEST_PHASE11) $(BIN_TEST_PHASE12) $(BIN_TEST_PHASE13) $(BIN_TEST_PHASE14) $(BIN_TEST_PHASE15) $(BIN_TEST_PHASE16) $(BIN_TEST_PHASE17) $(BIN_EXAMPLE_SERVER) $(BIN_EXAMPLE_CLIENT)
 
 $(BORINGSSL_LIBS):
 	cmake -S boringssl -B boringssl/build
@@ -177,6 +183,27 @@ $(BIN_TEST_PHASE14): $(SRC_TEST_PHASE14) $(SRC_TLS) $(BORINGSSL_LIBS)
 test14: $(BIN_TEST_PHASE14) example-certs
 	$(call RUN_REPEATED,test14,./$(BIN_TEST_PHASE14))
 
+$(BIN_TEST_PHASE15): $(SRC_TEST_PHASE15) $(SRC_ACK)
+	mkdir -p $(@D)
+	$(CC) $(CFLAGS) $(INCLUDES) $(SRC_TEST_PHASE15) $(SRC_ACK) -o $@
+
+test15: $(BIN_TEST_PHASE15)
+	$(call RUN_REPEATED,test15,./$(BIN_TEST_PHASE15))
+
+$(BIN_TEST_PHASE16): $(SRC_TEST_PHASE16) $(SRC_ACK)
+	mkdir -p $(@D)
+	$(CC) $(CFLAGS) $(INCLUDES) $(SRC_TEST_PHASE16) $(SRC_ACK) -o $@
+
+test16: $(BIN_TEST_PHASE16)
+	$(call RUN_REPEATED,test16,./$(BIN_TEST_PHASE16))
+
+$(BIN_TEST_PHASE17): $(SRC_TEST_PHASE17) $(SRC_TLS) $(BORINGSSL_LIBS)
+	mkdir -p $(@D)
+	$(LD) $(CFLAGS) $(INCLUDES) $(SRC_TEST_PHASE17) $(SRC_TLS) -o $@ $(LDFLAGS)
+
+test17: $(BIN_TEST_PHASE17) example-certs
+	$(call RUN_REPEATED,test17,./$(BIN_TEST_PHASE17))
+
 SRC_RECOVERY = src/recovery/loss_detector.c
 SRC_TEST_PHASE5_1 = tests/test_phase5_1.c
 BIN_TEST_PHASE5_1 = $(TEST_BIN_DIR)/test_phase5_1_bin
@@ -217,6 +244,12 @@ topo-auto: quic-demo
 
 topo-auto-file: quic-demo
 	sudo python3 topo.py --auto-file --rounds $(TEST_REPEAT)
+
+topo-stage4-clean: quic-demo
+	sudo python3 topo.py --auto-file --profile clean-bdp --rounds $(TEST_REPEAT)
+
+topo-stage4-lossy: quic-demo
+	sudo python3 topo.py --auto-file --profile lossy-recovery --rounds $(TEST_REPEAT)
 
 # ==========================================
 # 网络与清理

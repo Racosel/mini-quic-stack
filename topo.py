@@ -16,6 +16,7 @@ from mininet.net import Mininet
 from mininet.node import Controller, OVSKernelSwitch
 
 DEFAULT_ROUNDS = 5
+DEFAULT_PROFILE = "default"
 TESTS_ROOT = Path("tests")
 BIN_DIR = TESTS_ROOT / "bin"
 CERT_DIR = TESTS_ROOT / "certs"
@@ -33,6 +34,49 @@ SERVER_READY_TIMEOUT_S = 10.0
 ANSI_RESET = "\033[0m"
 ANSI_ERROR_BG = "\033[41;97m"
 ANSI_DONE_BG = "\033[42;30m"
+
+NETWORK_PROFILES = {
+    "default": {
+        "description": "阶段 2/3 默认文件传输验证",
+        "bw_mbit": 100,
+        "client_delay_ms": 20,
+        "server_delay_ms": 10,
+        "client_loss_pct": 2.0,
+        "server_loss_pct": 0.0,
+        "upload_size": 32768,
+        "download_size": 24576,
+    },
+    "clean-bdp": {
+        "description": "阶段 4 clean BDP 验证：无丢包的大 bulk 传输",
+        "bw_mbit": 100,
+        "client_delay_ms": 20,
+        "server_delay_ms": 10,
+        "client_loss_pct": 0.0,
+        "server_loss_pct": 0.0,
+        "upload_size": 131072,
+        "download_size": 98304,
+    },
+    "lossy-recovery": {
+        "description": "阶段 4 lossy recovery 验证：有丢包的大 bulk 传输",
+        "bw_mbit": 100,
+        "client_delay_ms": 20,
+        "server_delay_ms": 10,
+        "client_loss_pct": 2.0,
+        "server_loss_pct": 0.0,
+        "upload_size": 131072,
+        "download_size": 98304,
+    },
+    "app-limited": {
+        "description": "小文件应用受限验证",
+        "bw_mbit": 100,
+        "client_delay_ms": 20,
+        "server_delay_ms": 10,
+        "client_loss_pct": 0.0,
+        "server_loss_pct": 0.0,
+        "upload_size": 4096,
+        "download_size": 4096,
+    },
+}
 
 
 def supports_ansi() -> bool:
@@ -53,7 +97,23 @@ def info_done(message: str) -> None:
     info(f"*** {status_label('DONE', ANSI_DONE_BG)} {message} ***\n")
 
 
-def build_network():
+def resolve_profile(profile_name: str, bw: float | None, delay: int | None, loss: float | None) -> dict:
+    if profile_name not in NETWORK_PROFILES:
+        raise ValueError(f"unknown profile: {profile_name}")
+
+    profile = dict(NETWORK_PROFILES[profile_name])
+    if bw is not None:
+        profile["bw_mbit"] = bw
+    if delay is not None:
+        profile["client_delay_ms"] = delay
+        profile["server_delay_ms"] = delay
+    if loss is not None:
+        profile["client_loss_pct"] = loss
+        profile["server_loss_pct"] = loss
+    return profile
+
+
+def build_network(profile: dict):
     net = Mininet(controller=Controller, switch=OVSKernelSwitch, link=TCLink)
 
     info("*** 添加控制器 ***\n")
@@ -68,9 +128,9 @@ def build_network():
 
     info("*** 创建带有网络特性的链路 ***\n")
     # 显式使用 TBF，避免 Mininet 默认 HTB 在 100Mbit 下反复打印 quantum warning。
-    link_shape = {"bw": 100, "use_tbf": True, "latency_ms": 50}
-    net.addLink(h1, s1, delay="20ms", loss=2, **link_shape)
-    net.addLink(h2, s1, delay="10ms", **link_shape)
+    link_shape = {"bw": profile["bw_mbit"], "use_tbf": True, "latency_ms": 50}
+    net.addLink(h1, s1, delay=f"{profile['client_delay_ms']}ms", loss=profile["client_loss_pct"], **link_shape)
+    net.addLink(h2, s1, delay=f"{profile['server_delay_ms']}ms", loss=profile["server_loss_pct"], **link_shape)
 
     return net
 
@@ -91,7 +151,7 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def prepare_file_transfer_case(repo_root: Path) -> dict:
+def prepare_file_transfer_case(repo_root: Path, profile: dict) -> dict:
     transfer_dir = repo_root / TRANSFER_DIR
     upload_path = repo_root / UPLOAD_FILE
     download_source_path = repo_root / DOWNLOAD_SOURCE_FILE
@@ -102,8 +162,8 @@ def prepare_file_transfer_case(repo_root: Path) -> dict:
     for reset_path in (upload_path, download_source_path, server_received_path, client_downloaded_path):
         if reset_path.exists():
             reset_path.unlink()
-    upload_path.write_bytes(deterministic_bytes(32768, 17))
-    download_source_path.write_bytes(deterministic_bytes(24576, 83))
+    upload_path.write_bytes(deterministic_bytes(profile["upload_size"], 17))
+    download_source_path.write_bytes(deterministic_bytes(profile["download_size"], 83))
 
     return {
         "upload_path": upload_path,
@@ -212,13 +272,13 @@ def verify_file_transfer_case(case: dict) -> bool:
     return False
 
 
-def print_manual_instructions(repo_root: Path, auto_file_mode: bool, rounds: int) -> None:
+def print_manual_instructions(repo_root: Path, auto_file_mode: bool, rounds: int, profile: dict, profile_name: str) -> None:
     info("*** 当前进程无 root 权限，无法启动 Mininet ***\n")
     print("请在具备 sudo 权限的终端手动执行以下命令：")
     if auto_file_mode:
-        print(f"  sudo python3 topo.py --auto-file --rounds {rounds}")
+        print(f"  sudo python3 topo.py --auto-file --profile {profile_name} --rounds {rounds}")
         try:
-            case = prepare_file_transfer_case(repo_root)
+            case = prepare_file_transfer_case(repo_root, profile)
             print("已预生成文件传输测试数据：")
             print(f"  客户端上传源文件: {case['upload_path']}")
             print(f"  服务端发送源文件: {case['download_source_path']}")
@@ -232,14 +292,20 @@ def print_manual_instructions(repo_root: Path, auto_file_mode: bool, rounds: int
             print("可先执行以下命令恢复目录所有权，再重试无 root 预生成：")
             print(f"  sudo chown -R $USER:$USER {repo_root / (TESTS_ROOT / 'data')}")
     else:
-        print(f"  sudo python3 topo.py --auto --rounds {rounds}")
+        print(f"  sudo python3 topo.py --auto --profile {profile_name} --rounds {rounds}")
 
-def run_single_auto_validation(net: Mininet, repo_root: Path, auto_file_mode: bool, round_index: int, rounds: int) -> bool:
+def run_single_auto_validation(net: Mininet,
+                               repo_root: Path,
+                               auto_file_mode: bool,
+                               round_index: int,
+                               rounds: int,
+                               profile: dict,
+                               profile_name: str) -> bool:
     h1 = net.get("h1")
     h2 = net.get("h2")
-    case = prepare_file_transfer_case(repo_root) if auto_file_mode else None
+    case = prepare_file_transfer_case(repo_root, profile) if auto_file_mode else None
 
-    info(f"*** 第 {round_index}/{rounds} 轮自动验证 ***\n")
+    info(f"*** 第 {round_index}/{rounds} 轮自动验证 ({profile_name}: {profile['description']}) ***\n")
     if auto_file_mode:
         server_cmd = (
             f"cd {repo_root} && "
@@ -330,36 +396,49 @@ def run_single_auto_validation(net: Mininet, repo_root: Path, auto_file_mode: bo
     return True
 
 
-def run_auto_validation(net: Mininet, repo_root: Path, auto_file_mode: bool, rounds: int) -> bool:
+def run_auto_validation(net: Mininet,
+                        repo_root: Path,
+                        auto_file_mode: bool,
+                        rounds: int,
+                        profile: dict,
+                        profile_name: str) -> bool:
     round_index = 1
 
     info("*** 构建 example 与测试证书 ***\n")
     ensure_examples_built(repo_root)
     while round_index <= rounds:
-        if not run_single_auto_validation(net, repo_root, auto_file_mode, round_index, rounds):
+        if not run_single_auto_validation(net, repo_root, auto_file_mode, round_index, rounds, profile, profile_name):
             return False
         round_index += 1
     info_done("全部自动验证完成")
     return True
 
 
-def run_quic_test_network(auto_mode: bool, auto_file_mode: bool, rounds: int) -> int:
+def run_quic_test_network(auto_mode: bool,
+                          auto_file_mode: bool,
+                          rounds: int,
+                          profile_name: str,
+                          bw: float | None,
+                          delay: int | None,
+                          loss: float | None) -> int:
     repo_root = Path(__file__).resolve().parent
+    profile = resolve_profile(profile_name, bw, delay, loss)
 
     if os.geteuid() != 0:
-        print_manual_instructions(repo_root, auto_file_mode, rounds)
+        print_manual_instructions(repo_root, auto_file_mode, rounds, profile, profile_name)
         return 0
 
     setLogLevel("info")
     info("*** 创建受控的 QUIC 测试网络 ***\n")
-    net = build_network()
+    info(f"*** 采用网络 profile: {profile_name} ({profile['description']}) ***\n")
+    net = build_network(profile)
 
     info("*** 启动网络 ***\n")
     net.start()
 
     try:
         if auto_mode or auto_file_mode:
-            ok = run_auto_validation(net, repo_root, auto_file_mode, rounds)
+            ok = run_auto_validation(net, repo_root, auto_file_mode, rounds, profile, profile_name)
             if not ok:
                 info_error("自动验证失败")
             return 0 if ok else 1
@@ -378,8 +457,15 @@ def main() -> int:
     parser.add_argument("--auto", action="store_true", help="自动构建并运行 QUIC client/server 验证")
     parser.add_argument("--auto-file", action="store_true", help="自动构建并运行包含文件传输的 QUIC client/server 验证")
     parser.add_argument("--rounds", type=int, default=DEFAULT_ROUNDS, help="自动验证轮数，默认 5")
+    parser.add_argument("--profile",
+                        choices=sorted(NETWORK_PROFILES.keys()),
+                        default=DEFAULT_PROFILE,
+                        help="链路与流量 profile，默认 default")
+    parser.add_argument("--bw", type=float, default=None, help="覆盖 profile 的链路带宽（Mbit/s）")
+    parser.add_argument("--delay", type=int, default=None, help="覆盖 profile 的双向链路时延（ms）")
+    parser.add_argument("--loss", type=float, default=None, help="覆盖 profile 的双向链路丢包率（百分比）")
     args = parser.parse_args()
-    return run_quic_test_network(args.auto, args.auto_file, args.rounds)
+    return run_quic_test_network(args.auto, args.auto_file, args.rounds, args.profile, args.bw, args.delay, args.loss)
 
 
 if __name__ == "__main__":

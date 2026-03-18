@@ -1,0 +1,230 @@
+# 中断记录
+
+- `时间`: 2026-03-18 22:xx Asia/Shanghai
+- `阶段`: 阶段 4 / RFC 9000 + RFC 9002 恢复、拥塞控制与端到端 bulk 测试
+- `原因`: 电脑电量不足，即将关机，需要保存当前上下文以便下次续做
+
+## 当前目标
+
+继续完成阶段 4 的代码与测试，严格依据根目录 `rfc-docs/9000`、`rfc-docs/9002`。
+
+当前还没收口的点是：
+
+- `lossy bulk transfer` 端到端测试还没有通过
+- 需要把 `STREAM` 丢包恢复从“整段 flight 回退”改成“按 offset/len 精确重传”
+- 需要在完成后更新 `debug` 和 `README.md` 的阶段 4 状态
+
+## 本轮已经完成的事情
+
+### 1. 阶段 4 恢复/拥塞控制主骨架已实现
+
+已经完成并落盘的阶段 4 代码包括：
+
+- `include/quic_recovery.h`
+- `src/recovery/loss_detector.c`
+- `include/quic_connection.h`
+- `src/transport/quic_connection.c`
+- `include/quic_stream.h`
+- `src/transport/quic_stream.c`
+- `src/tls/quic_tls.c`
+- `tests/test_phase15.c`
+- `tests/test_phase16.c`
+- `tests/test_phase17.c`
+- `README.md`
+
+主要内容：
+
+- 增加了 RFC 9002 风格的 recovery state
+- 增加了 RTT、ack_delay、packet-threshold / time-threshold loss detection
+- 增加了 PTO timer、cwnd、ssthresh、persistent congestion
+- `quic_tls` 已接入 recovery timer、ACK 处理、bytes_in_flight、cwnd gate
+- `README.md` 已写入阶段 4 设计与测试分层
+
+### 2. 已修掉的阶段 4 bug
+
+本轮已经修掉并验证过的 bug：
+
+- `loss_detector.c` 里 `latest_loss_time == 0` 同时充当“无值”和“有效 sent_time=0”哨兵，导致 loss 检测错误
+- 同一 ACK 既触发拥塞事件又立刻增长 cwnd，导致 persistent congestion 后窗口被错误回涨
+- `quic_tls.c` 在 `BUILD_BLOCKED` 前过早推进 application send state，导致未真正发送的数据被逻辑上“吞掉”
+
+其中第三个问题是本轮最关键的新发现：
+
+- 原因：`quic_tls_build_payload_for_level()` 在 application space 里会先调用 `quic_stream_map_note_stream_send()` / 标记 control frame `pending -> in_flight`
+- 但真正的 `cwnd` / anti-amplification 检查发生在 `quic_packet_protect()` 之后
+- 一旦返回 `QUIC_TLS_BUILD_BLOCKED`，某些 `STREAM` 数据和控制帧状态已经被推进，网络上却根本没发出去
+- 这直接造成了 clean bulk 测试中间 offset 出现洞
+
+这个问题已经修掉：
+
+- 在 `src/tls/quic_tls.c` 为 application send path 增加了快照/回滚
+- 只要 datagram 没有真正通过 build/send，application send state 就回滚
+
+## 当前测试状态
+
+### 已通过
+
+- `make TEST_REPEAT=1 test15`
+- `make TEST_REPEAT=1 test16`
+
+`test17` 中已确认通过的子测试：
+
+- `blocked build does not consume send state`
+- `clean bulk transfer grows cwnd`
+- `small flow control window is observable`
+
+其中：
+
+- `QUIC_STAGE4_CASE=flow make TEST_REPEAT=1 test17` 已通过
+- `clean` 子测试也已经通过
+
+### 当前仍未通过
+
+- `QUIC_STAGE4_CASE=lossy timeout 30s stdbuf -oL tests/bin/test_phase17_bin`
+
+现象：
+
+- 没有报错退出，但在 30 秒内始终无法完成
+- 说明 clean bulk 的“吞数据”主根因已修复
+- 剩余问题集中在 `lossy bulk transfer recovers` 路径
+
+## 当前结论：剩余问题的根因
+
+剩余问题大概率不是 RTT / PTO / cwnd 主逻辑错误，而是：
+
+- `STREAM` 丢包恢复仍然在用“整段 flight 回退”
+- 当前 `quic_tls_on_packet_lost()` 对 stream packet 的处理仍是：
+  - `quic_crypto_sendbuf_restart_flight(&stream->sendbuf);`
+  - 对大流来说，这等于从 flight 起点整体重发
+- 在 `96 KiB` bulk + “每 5 个 short header 丢 1 个”的测试里，这会导致恢复效率极差，甚至接近 livelock
+
+这不满足阶段 4 需要的精确恢复语义。下一步应改成：
+
+- 在 `packet meta` 里记录 `stream_offset` 和 `stream_length`
+- packet lost 时，把这段 `STREAM` 数据按 `offset/len` 加入 retransmit ranges
+- `prepare_stream_send()` 优先发送 retransmit ranges，而不是整段 `restart_flight`
+- packet acked 时，如果对应范围已被标记待重传，需要把该范围从 retransmit ranges 中删除
+
+## 刚刚做了一半、还没接完的改动
+
+这一条非常重要：
+
+- 我已经在 `include/quic_recovery.h` 里给 `quic_sent_packet_meta_t` 新增了：
+  - `stream_offset`
+  - `stream_length`
+
+但这只是第一步，后续还没接完。
+
+还没做完的配套改动包括：
+
+1. `include/quic_stream.h`
+   - 增加 stream retransmit range 结构
+   - 在 `quic_stream_t` 中增加 retransmit 队列
+   - 调整 `quic_stream_map_prepare_stream_send()` 签名，返回选中的 `offset`
+   - 新增 `quic_stream_map_on_stream_acked()` / `quic_stream_map_on_stream_lost()`
+
+2. `src/transport/quic_stream.c`
+   - 实现 retransmit range 的插入、合并、删除
+   - `prepare_stream_send()` 优先选择 retransmit range
+   - `note_stream_send()` 区分“新发送”与“重传发送”
+   - `has_buffered_send_data()` / `can_transmit()` / `is_flow_control_limited()` 兼容 retransmit ranges
+
+3. `src/tls/quic_tls.c`
+   - `quic_tls_append_stream_frame()` 把 `offset/len` 写入 `packet_meta`
+   - `quic_tls_clear_stream_inflight()` 在 ACK / loss 时调用 `quic_stream_map_on_stream_acked()` / `quic_stream_map_on_stream_lost()`
+   - 不再对 stream loss 直接 `restart_flight()`
+   - 当前 application snapshot 结构也要扩展，纳入 retransmit ranges，否则 `BUILD_BLOCKED` 仍会把重传队列弄脏
+
+4. `tests/test_phase17.c`
+   - 当前已经加了 `QUIC_STAGE4_CASE` 环境变量，支持单独跑：
+     - `blocked`
+     - `clean`
+     - `lossy`
+     - `flow`
+   - 这个入口可以保留，便于继续定位
+   - 最后要确保 `lossy` 子测试也通过
+
+## 当前已经落盘的重要代码位置
+
+### `src/tls/quic_tls.c`
+
+本轮已完成：
+
+- 增加 application send state snapshot / restore
+- 在以下失败路径回滚：
+  - `quic_tls_build_payload_for_level()` 失败
+  - `quic_tls_prepare_plan()` 失败
+  - header encode 失败
+  - `quic_packet_protect()` 失败
+  - anti-amplification blocked
+  - `quic_recovery_can_send()` blocked
+
+这部分不应丢。
+
+### `tests/test_phase17.c`
+
+本轮已完成：
+
+- 新增 `test_stage4_build_blocked_does_not_consume_send_state()`
+- `configure_pair()` 在握手后会 `drain_pending_pair()`
+- `main()` 支持 `QUIC_STAGE4_CASE`
+
+这部分也不应丢。
+
+## 推荐的下次续做顺序
+
+1. 从 `include/quic_stream.h` 开始，把 retransmit range 数据结构补齐
+2. 再补 `src/transport/quic_stream.c` 的 offset/len 精确重传逻辑
+3. 再接 `src/tls/quic_tls.c` 的 packet meta 和 ACK/loss side effects
+4. 先跑：
+   - `QUIC_STAGE4_CASE=lossy make TEST_REPEAT=1 test17`
+5. 如果通过，再跑完整回归：
+   - `make TEST_REPEAT=1 test15`
+   - `make TEST_REPEAT=1 test16`
+   - `make TEST_REPEAT=1 test17`
+6. 最后再跑默认重复次数版本：
+   - `make test15`
+   - `make test16`
+   - `make test17`
+7. 收尾更新：
+   - `debug`
+   - `README.md`
+   - `log`
+
+## 额外注意
+
+- 这次用户明确要求：必须严格按根目录 `rfc-docs/` 中的 IETF 文档设计和编写
+- 当前最相关的是：
+  - `rfc-docs/9000`
+  - `rfc-docs/9002`
+- 特别要注意：
+  - recovery 的时机与伪代码对应 `RFC 9002 Appendix A`
+  - `OnPacketSent` 只能在包真正发送后生效
+  - 丢失的是包，但重传的是 frame data，不是 packet number
+
+## 现在工作树里值得注意的文件
+
+根据刚才的 `git status --short`，当前有这些改动或新增：
+
+- `Makefile`
+- `README.md`
+- `include/quic_connection.h`
+- `include/quic_recovery.h`
+- `include/quic_stream.h`
+- `src/recovery/loss_detector.c`
+- `src/tls/quic_tls.c`
+- `src/transport/quic_connection.c`
+- `src/transport/quic_stream.c`
+- `tests/test_phase15.c`
+- `tests/test_phase16.c`
+- `tests/test_phase17.c`
+
+以及测试产物：
+
+- `tests/bin/`
+- `tests/certs/server_cert.pem`
+- `tests/certs/server_key.pem`
+
+## 一句话状态
+
+阶段 4 的 recovery / cwnd 主骨架已经成型，`BUILD_BLOCKED` 吞数据 bug 已修，clean bulk / flow-control 都过了；当前唯一还没收口的是 lossy bulk，需要把 stream loss 恢复改成按 `offset/len` 精确重传。

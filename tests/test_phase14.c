@@ -234,6 +234,59 @@ static void test_stage3_multistream_flow_control(void) {
     printf("[PASS] Stage 3 multi-stream transfer advances MAX_DATA and MAX_STREAM_DATA credits\n");
 }
 
+static void test_stage3_packet_meta_keeps_control_stream_identity(void) {
+    quic_tls_conn_t client;
+    quic_tls_conn_t server;
+    uint64_t stream0;
+    uint64_t stream4;
+    static const uint8_t msg0[] =
+        "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    static const uint8_t msg4[] = "small-control-trigger";
+    static const uint8_t response4[] = "server-stream-4 response payload";
+    uint8_t recv0[128];
+    uint8_t recv4[64];
+    size_t recv0_len = 0;
+    size_t recv4_len = 0;
+    int recv0_fin = 0;
+    int recv4_fin = 0;
+    captured_packet_t packet;
+    const quic_sent_packet_t *tail;
+
+    memset(recv0, 0, sizeof(recv0));
+    memset(recv4, 0, sizeof(recv4));
+    configure_pair(&client, &server, 256, 64, 4);
+
+    assert(quic_tls_conn_open_stream(&client, 1, &stream0) == 0);
+    assert(quic_tls_conn_open_stream(&client, 1, &stream4) == 0);
+    assert(stream0 == 0);
+    assert(stream4 == 4);
+    assert(quic_tls_conn_stream_write(&client, stream0, msg0, sizeof(msg0) - 1, 1) == 0);
+    assert(quic_tls_conn_stream_write(&client, stream4, msg4, sizeof(msg4) - 1, 1) == 0);
+
+    while (flush_pending(&client, &server)) {
+    }
+
+    while (recv0_len < 32) {
+        assert(drain_stream(&server, stream0, recv0, sizeof(recv0), &recv0_len, &recv0_fin) == 1);
+    }
+    while (!recv4_fin) {
+        assert(drain_stream(&server, stream4, recv4, sizeof(recv4), &recv4_len, &recv4_fin) == 1);
+    }
+    assert(quic_tls_conn_stream_write(&server, stream4, response4, sizeof(response4) - 1, 1) == 0);
+
+    assert(capture_one(&server, &packet) == 1);
+    tail = server.conn.spaces[QUIC_PN_SPACE_APPLICATION].in_flight.tail;
+    assert(tail != NULL);
+    assert(tail->meta.includes_max_stream_data == 1);
+    assert(tail->meta.includes_stream == 1);
+    assert(tail->meta.control_stream_id == stream0);
+    assert(tail->meta.stream_id == stream4);
+
+    quic_tls_conn_free(&client);
+    quic_tls_conn_free(&server);
+    printf("[PASS] Stage 3 packet metadata preserves per-stream control-frame identity when MAX_STREAM_DATA and STREAM share a packet\n");
+}
+
 static void test_stage3_stop_sending_prompts_reset(void) {
     quic_tls_conn_t client;
     quic_tls_conn_t server;
@@ -466,6 +519,7 @@ static void test_stage3_ack_ranges_preserve_stream_gap(void) {
 
 int main(void) {
     test_stage3_multistream_flow_control();
+    test_stage3_packet_meta_keeps_control_stream_identity();
     test_stage3_stop_sending_prompts_reset();
     test_stage3_connection_close_round_trip();
     test_stage3_terminal_receive_discards_retransmitted_stream();

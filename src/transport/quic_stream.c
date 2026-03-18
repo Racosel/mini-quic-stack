@@ -63,6 +63,7 @@ static int quic_stream_can_transmit(const quic_stream_t *stream) {
            !stream->reset_pending &&
            !stream->reset_received &&
            (stream->send_open ||
+            stream->retransmit_range_count > 0 ||
             stream->sendbuf.flight_pending ||
             stream->sendbuf.len > stream->sendbuf.flight_end ||
             (stream->fin_requested && !stream->fin_sent) ||
@@ -95,6 +96,109 @@ static int quic_stream_maybe_discard_terminal_recv(const quic_stream_t *stream,
     return 1;
 }
 
+static uint64_t quic_stream_range_len(const quic_stream_send_range_t *range) {
+    if (!range || range->end <= range->start) {
+        return 0;
+    }
+    return range->end - range->start;
+}
+
+static int quic_stream_add_retransmit_range(quic_stream_t *stream, uint64_t start, uint64_t end) {
+    size_t insert_at;
+    size_t merge_end;
+    size_t count;
+
+    if (!stream || start >= end) {
+        return 0;
+    }
+
+    count = stream->retransmit_range_count;
+    insert_at = 0;
+    while (insert_at < count && stream->retransmit_ranges[insert_at].end < start) {
+        insert_at++;
+    }
+
+    merge_end = insert_at;
+    while (merge_end < count && stream->retransmit_ranges[merge_end].start <= end) {
+        if (stream->retransmit_ranges[merge_end].start < start) {
+            start = stream->retransmit_ranges[merge_end].start;
+        }
+        if (stream->retransmit_ranges[merge_end].end > end) {
+            end = stream->retransmit_ranges[merge_end].end;
+        }
+        merge_end++;
+    }
+
+    if (merge_end == insert_at && count == QUIC_STREAM_MAX_RETRANSMIT_RANGES) {
+        return -1;
+    }
+
+    if (merge_end > insert_at) {
+        memmove(&stream->retransmit_ranges[insert_at + 1],
+                &stream->retransmit_ranges[merge_end],
+                sizeof(stream->retransmit_ranges[0]) * (count - merge_end));
+        count -= (merge_end - insert_at - 1);
+    } else {
+        memmove(&stream->retransmit_ranges[insert_at + 1],
+                &stream->retransmit_ranges[insert_at],
+                sizeof(stream->retransmit_ranges[0]) * (count - insert_at));
+        count++;
+    }
+
+    stream->retransmit_ranges[insert_at].start = start;
+    stream->retransmit_ranges[insert_at].end = end;
+    stream->retransmit_range_count = count;
+    return 0;
+}
+
+static void quic_stream_remove_retransmit_range(quic_stream_t *stream, uint64_t start, uint64_t end) {
+    size_t i;
+
+    if (!stream || start >= end) {
+        return;
+    }
+
+    for (i = 0; i < stream->retransmit_range_count;) {
+        quic_stream_send_range_t *range = &stream->retransmit_ranges[i];
+
+        if (range->end <= start || range->start >= end) {
+            i++;
+            continue;
+        }
+
+        if (start <= range->start && end >= range->end) {
+            memmove(range,
+                    range + 1,
+                    sizeof(stream->retransmit_ranges[0]) * (stream->retransmit_range_count - i - 1));
+            stream->retransmit_range_count--;
+            continue;
+        }
+
+        if (start <= range->start) {
+            range->start = end;
+            i++;
+            continue;
+        }
+
+        if (end >= range->end) {
+            range->end = start;
+            i++;
+            continue;
+        }
+
+        if (stream->retransmit_range_count < QUIC_STREAM_MAX_RETRANSMIT_RANGES) {
+            memmove(range + 2,
+                    range + 1,
+                    sizeof(stream->retransmit_ranges[0]) * (stream->retransmit_range_count - i - 1));
+            stream->retransmit_ranges[i + 1].start = end;
+            stream->retransmit_ranges[i + 1].end = range->end;
+            stream->retransmit_range_count++;
+        }
+        range->end = start;
+        i++;
+    }
+}
+
 static size_t quic_stream_send_candidate_len(const quic_stream_map_t *map, const quic_stream_t *stream) {
     size_t pending;
     uint64_t start;
@@ -106,6 +210,10 @@ static size_t quic_stream_send_candidate_len(const quic_stream_map_t *map, const
 
     if (!map || !stream || !quic_stream_can_transmit(stream)) {
         return 0;
+    }
+
+    if (stream->retransmit_range_count > 0) {
+        return (size_t)quic_stream_range_len(&stream->retransmit_ranges[0]);
     }
 
     if (quic_crypto_sendbuf_has_pending(&stream->sendbuf)) {
@@ -772,6 +880,7 @@ int quic_stream_map_has_pending_output(const quic_stream_map_t *map) {
         if (stream->stop_sending_pending ||
             stream->reset_pending ||
             stream->max_stream_data_pending ||
+            stream->retransmit_range_count > 0 ||
             (stream->fin_requested && !stream->fin_sent &&
              !quic_crypto_sendbuf_has_pending(&stream->sendbuf) &&
              stream->sendbuf.send_offset >= stream->sendbuf.flight_end)) {
@@ -785,14 +894,71 @@ int quic_stream_map_has_pending_output(const quic_stream_map_t *map) {
     return 0;
 }
 
+int quic_stream_map_has_buffered_send_data(const quic_stream_map_t *map) {
+    size_t i;
+
+    if (!map) {
+        return 0;
+    }
+    if (map->max_data_pending || map->max_streams_bidi_pending || map->max_streams_uni_pending) {
+        return 1;
+    }
+
+    for (i = 0; i < QUIC_STREAM_MAX_COUNT; i++) {
+        const quic_stream_t *stream = &map->streams[i];
+
+        if (!stream->active || !quic_stream_can_transmit(stream)) {
+            continue;
+        }
+        if (stream->stop_sending_pending ||
+            stream->reset_pending ||
+            stream->max_stream_data_pending ||
+            stream->retransmit_range_count > 0 ||
+            quic_crypto_sendbuf_has_pending(&stream->sendbuf) ||
+            stream->sendbuf.len > stream->send_highest_offset ||
+            (stream->fin_requested && !stream->fin_sent)) {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+int quic_stream_map_is_flow_control_limited(const quic_stream_map_t *map) {
+    size_t i;
+
+    if (!map) {
+        return 0;
+    }
+
+    for (i = 0; i < QUIC_STREAM_MAX_COUNT; i++) {
+        const quic_stream_t *stream = &map->streams[i];
+
+        if (!stream->active || !quic_stream_can_transmit(stream)) {
+            continue;
+        }
+        if (stream->sendbuf.len > stream->send_highest_offset &&
+            quic_stream_send_candidate_len(map, stream) == 0) {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
 int quic_stream_map_prepare_stream_send(quic_stream_map_t *map,
                                         quic_stream_t **out_stream,
+                                        uint64_t *out_offset,
                                         size_t *out_len,
-                                        int *out_fin_only) {
+                                        int *out_fin_only,
+                                        int *out_is_retransmit) {
     size_t i;
 
     if (out_stream) {
         *out_stream = NULL;
+    }
+    if (out_offset) {
+        *out_offset = 0;
     }
     if (out_len) {
         *out_len = 0;
@@ -800,7 +966,10 @@ int quic_stream_map_prepare_stream_send(quic_stream_map_t *map,
     if (out_fin_only) {
         *out_fin_only = 0;
     }
-    if (!map || !out_stream || !out_len || !out_fin_only) {
+    if (out_is_retransmit) {
+        *out_is_retransmit = 0;
+    }
+    if (!map || !out_stream || !out_offset || !out_len || !out_fin_only || !out_is_retransmit) {
         return -1;
     }
 
@@ -811,6 +980,13 @@ int quic_stream_map_prepare_stream_send(quic_stream_map_t *map,
         if (!stream->active || !quic_stream_can_transmit(stream)) {
             continue;
         }
+        if (stream->retransmit_range_count > 0) {
+            *out_stream = stream;
+            *out_offset = stream->retransmit_ranges[0].start;
+            *out_len = (size_t)quic_stream_range_len(&stream->retransmit_ranges[0]);
+            *out_is_retransmit = 1;
+            return 1;
+        }
         if (!quic_crypto_sendbuf_has_pending(&stream->sendbuf) &&
             stream->sendbuf.len > stream->sendbuf.flight_end) {
             quic_crypto_sendbuf_mark_flight(&stream->sendbuf);
@@ -818,6 +994,7 @@ int quic_stream_map_prepare_stream_send(quic_stream_map_t *map,
         if (!quic_crypto_sendbuf_has_pending(&stream->sendbuf)) {
             if (stream->fin_requested && !stream->fin_sent) {
                 *out_stream = stream;
+                *out_offset = stream->sendbuf.len;
                 *out_fin_only = 1;
                 return 1;
             }
@@ -829,6 +1006,7 @@ int quic_stream_map_prepare_stream_send(quic_stream_map_t *map,
             continue;
         }
         *out_stream = stream;
+        *out_offset = stream->sendbuf.send_offset;
         *out_len = (size_t)candidate;
         return 1;
     }
@@ -840,7 +1018,8 @@ void quic_stream_map_note_stream_send(quic_stream_map_t *map,
                                       quic_stream_t *stream,
                                       uint64_t offset,
                                       size_t len,
-                                      int fin) {
+                                      int fin,
+                                      int is_retransmit) {
     uint64_t end_offset;
 
     if (!map || !stream) {
@@ -854,7 +1033,11 @@ void quic_stream_map_note_stream_send(quic_stream_map_t *map,
     }
 
     if (len > 0) {
-        quic_crypto_sendbuf_advance(&stream->sendbuf, len);
+        if (is_retransmit) {
+            quic_stream_remove_retransmit_range(stream, offset, end_offset);
+        } else {
+            quic_crypto_sendbuf_advance(&stream->sendbuf, len);
+        }
     }
     if (fin) {
         stream->fin_sent = 1;
@@ -863,6 +1046,38 @@ void quic_stream_map_note_stream_send(quic_stream_map_t *map,
         stream->send_final_size_known = 1;
         stream->send_final_size = stream->sendbuf.len;
     }
+}
+
+void quic_stream_map_on_stream_acked(quic_stream_map_t *map,
+                                     uint64_t stream_id,
+                                     uint64_t offset,
+                                     size_t len) {
+    quic_stream_t *stream;
+
+    if (!map || len == 0) {
+        return;
+    }
+    stream = quic_stream_map_find(map, stream_id);
+    if (!stream) {
+        return;
+    }
+    quic_stream_remove_retransmit_range(stream, offset, offset + len);
+}
+
+void quic_stream_map_on_stream_lost(quic_stream_map_t *map,
+                                    uint64_t stream_id,
+                                    uint64_t offset,
+                                    size_t len) {
+    quic_stream_t *stream;
+
+    if (!map || len == 0) {
+        return;
+    }
+    stream = quic_stream_map_find(map, stream_id);
+    if (!stream) {
+        return;
+    }
+    (void)quic_stream_add_retransmit_range(stream, offset, offset + len);
 }
 
 void quic_stream_map_restart_flights(quic_stream_map_t *map) {

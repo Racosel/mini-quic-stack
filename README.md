@@ -160,6 +160,20 @@ make topo-auto
 make topo-auto-file
 ```
 
+如果要按阶段 4 的大 bulk profile 验证恢复与拥塞控制，可以运行：
+
+```bash
+make topo-stage4-clean
+make topo-stage4-lossy
+```
+
+也可以直接覆盖链路参数：
+
+```bash
+sudo python3 topo.py --auto-file --profile clean-bdp --rounds 5
+sudo python3 topo.py --auto-file --profile lossy-recovery --bw 100 --delay 20 --loss 2 --rounds 5
+```
+
 该模式会在 `tests/data/topo-transfer/` 下生成和校验以下文件：
 
 - `client_upload.bin`: 客户端上传源文件
@@ -181,7 +195,150 @@ make topo-auto-file
 
 阶段 3：已完成流与连接级流控基础。当前已实现 stream 状态机、发送缓冲、接收重组、FIN/RESET/STOP_SENDING、MAX_DATA/MAX_STREAM_DATA/MAX_STREAMS 的 enforcement，以及基本调度器。`tests/test_phase14.c` 和本机 UDP `example/` 已证明双方能在多个双向流上稳定传输数据，并能触发和消费流控更新帧。
 
-阶段 4：实现 RFC 9002 的恢复与拥塞控制主体。要把现在的极简 in-flight bookkeeping 扩展成完整 sent-packet map、RTT 估计、ack delay 处理、loss detection、PTO、拥塞窗口、慢启动/拥塞避免、ECN 验证。完成标志是出现丢包、乱序、重传和超时时，连接仍能收敛并继续传输。
+阶段 4：已完成 RFC 9002 的恢复与拥塞控制主体。当前已经补齐 sent-packet metadata、RTT 估计、ack delay 处理、packet-threshold / time-threshold loss detection、PTO、拥塞窗口、慢启动 / congestion avoidance、persistent congestion，以及区分 congestion-limited / flow-control-limited / application-limited 的测试。`tests/test_phase15.c`、`tests/test_phase16.c`、`tests/test_phase17.c` 已覆盖恢复状态机、拥塞控制与内存内 bulk 传输；`topo.py` 也已支持 `clean-bdp`、`lossy-recovery`、`app-limited` 等 profile 驱动的真实网络大文件验证。
+
+#### 阶段 4 设计细化
+
+阶段 4 不应再把“恢复”“拥塞控制”“流控”“真实网络验证”混在一个大补丁里完成，而应分为 4 个层次推进：恢复状态机、拥塞控制器、流控/应用受限交互、真实网络验证。当前阶段 3 已经有流状态机和基础流控，因此阶段 4 的重点不是重新实现流控，而是确保拥塞控制不会把“拥塞受限”和“流控受限”混淆。
+
+##### 1. 设计边界
+
+- 本阶段先做单路径 RFC 9002 主体，不同时引入连接迁移、多路径或 Key Update。
+- 本阶段的发送约束分成 3 类并显式区分：
+  - `congestion_window` 约束：由拥塞控制决定能发多少字节。
+  - `bytes_in_flight` 约束：由已发未确认的 ack-eliciting 包决定。
+  - flow control 约束：由 `MAX_DATA` / `MAX_STREAM_DATA` / `MAX_STREAMS` 决定应用还能排入多少数据。
+- “流控是否正确”在阶段 3 已有基础，本阶段需要补的是：
+  - 当连接是 flow-control-limited 或 application-limited 时，拥塞窗口不应被错误增长。
+  - 当 flow control 被放开后，发送器应能重新利用已有拥塞窗口继续发包。
+
+##### 2. 建议的数据结构与模块划分
+
+- 扩展 `include/quic_recovery.h` 与 `src/recovery/loss_detector.c`，不再只保存“包号 + 大小 + ack-eliciting”，而是至少补齐：
+  - `time_sent`
+  - `sent_bytes`
+  - `ack_eliciting`
+  - `in_flight`
+  - `is_crypto_packet`
+  - `is_pto_probe`
+  - `packet_number_space`
+  - 指向待重传数据的引用或重建信息
+- 在连接对象或 TLS 连接对象中新增统一恢复状态：
+  - RTT 状态：`latest_rtt`、`smoothed_rtt`、`rttvar`、`min_rtt`、`first_rtt_sample`
+  - loss detection 状态：`loss_time[space]`、`largest_acked[space]`、`pto_count`、`time_of_last_ack_eliciting_packet[space]`
+  - congestion control 状态：`congestion_window`、`ssthresh`、`bytes_in_flight`、`congestion_recovery_start_time`
+  - ECN 状态：每个包号空间的已发送 ECT 统计、对端上报的 `ECT(0)` / `ECT(1)` / `CE` 基线、path 上的 ECN 验证状态
+- 建议把实现分成 3 个恢复模块，而不是继续把所有逻辑堆在 `quic_tls.c`：
+  - `src/recovery/loss_detector.c`：RTT、ACK 驱动的丢包检测、PTO
+  - `src/recovery/congestion_control.c`：NewReno、持久拥塞、是否可发送
+  - `src/recovery/ecn.c`：ECN 发送标记策略与 ACK 中 ECN 计数校验
+
+##### 3. 推荐的实现顺序
+
+1. 先把 sent-packet map 做完整，并把当前 `quic_on_packet_sent()` / `quic_on_packet_acked()` 升级为“按包号空间保存与删除 sent packet 元数据”。
+2. 实现 RTT 采样、`ack_delay` 处理和 `SetLossDetectionTimer()`，但先不引入拥塞窗口收缩。
+3. 实现 ACK 驱动的丢包检测：
+   - `kPacketThreshold=3`
+   - `kTimeThreshold=9/8`
+   - `kGranularity=1ms`
+4. 实现 PTO：
+   - Initial / Handshake 空间 `max_ack_delay=0`
+   - Application 空间只在握手确认后纳入 `max_ack_delay`
+   - anti-amplification 受限时不设 PTO
+5. 实现 NewReno：
+   - 初始窗口
+   - slow start
+   - congestion avoidance
+   - recovery period
+   - persistent congestion
+6. 最后再加 ECN：
+   - 先支持 ACK 中 ECN count 编解码与状态记录
+   - 再做路径验证与失败后禁用 ECN
+
+##### 4. 测试设计
+
+阶段 4 不能只靠 `topo.py` 跑通一次。合理测试应拆成 3 层。
+
+第一层：纯恢复/拥塞控制单元测试，建议新增 `tests/test_phase15.c`
+
+- 使用伪时钟而不是 `gettimeofday()`，让 RTT、PTO、loss deadline、persistent congestion 可重复。
+- 直接构造 sent packet、ACK frame、丢包序列，验证：
+  - RTT 首次采样与平滑更新
+  - Application 空间 `ack_delay` 只在握手确认后生效
+  - packet-threshold 与 time-threshold 两种丢包判定
+  - PTO 选择哪个包号空间、连续 PTO 的指数退避
+  - 丢弃 Initial / Handshake keys 后恢复状态是否正确清理
+
+第二层：拥塞控制与流控交互测试，建议新增 `tests/test_phase16.c`
+
+- 不直接依赖 Mininet，而是在内存内驱动 sender / receiver，明确区分 3 种受限状态：
+  - congestion-limited
+  - flow-control-limited
+  - application-limited
+- 核心用例应覆盖：
+  - slow start 下 ACK 驱动窗口增长
+  - loss 或 ECN-CE 触发恢复期与窗口减半
+  - persistent congestion 触发窗口坍缩到 minimum window
+  - flow control 未放开时窗口不增长
+  - flow control 放开后发送立即恢复，且仍受拥塞窗口约束
+  - 应用暂时没数据时不把空闲误判为网络拥塞
+
+第三层：真实网络验证，建议新增 `tests/test_phase17.c` 对应的 `example/` / `topo.py` 方案
+
+- 这里不再验证“握手能否成功”，而是验证：
+  - 长流在无损/有损链路上是否能逐步打开窗口
+  - loss/PTO 后是否还能继续传输
+  - receive window 很小时，发送器是否表现为 flow-control-limited 而不是拥塞退避
+  - ECN 开启时，ACK 中的 ECN 计数是否可见且能驱动拥塞事件
+
+##### 5. 是否需要改动网络拓扑
+
+阶段 4 早期不需要把当前两主机一交换机拓扑改成更复杂的多交换机网络。现有单 bottleneck 拓扑已经足够验证 RFC 9002 主体。真正需要改的是“链路参数和流量特征的可配置性”，而不是拓扑形状本身。
+
+- 保留当前 `h1 <-> s1 <-> h2` 结构作为默认拓扑。
+- `topo.py` 已扩展为 profile 驱动，当前支持 `default`、`clean-bdp`、`lossy-recovery`、`app-limited`，并支持 `--bw`、`--delay`、`--loss` 覆盖默认参数。
+- 至少增加以下链路维度：
+  - `bw`
+  - `delay`
+  - `loss`
+  - `max_queue_size`
+  - `reorder`
+  - `ecn`
+- 必要时增加一个可选的第三主机做 cross traffic，但这应当是“后续增强项”，不是阶段 4 完成的前置条件。
+
+##### 6. 推荐的网络 profile
+
+为了合理区分拥塞控制与流控，建议至少准备 4 组 profile：
+
+- `clean-bdp`: 无丢包、中等 RTT、较大队列。
+  用于观察 slow start 和 congestion avoidance 的基本收敛。
+- `lossy-recovery`: 1%-3% 随机丢包、中等 RTT、小到中等队列。
+  用于验证 ACK 驱动 loss detection、PTO、恢复期和持久拥塞。
+- `flow-limited`: 无丢包，但把 `initial_max_data` / `initial_max_stream_data_*` 设得远小于 BDP。
+  用于验证发送端能识别自己是 flow-control-limited，而不是错误触发拥塞退避。
+- `ecn-marking`: 无显式丢包、开启 ECN 标记或模拟 ACK 中 ECN 计数。
+  用于验证 ECN 状态机和“验证失败后禁用 ECN”。
+
+##### 7. 推荐的流量特征
+
+阶段 4 的真实验证流量不应只是一条几 KB 的小消息。至少需要：
+
+- 单长流 bulk transfer：
+  例如单个 stream 连续发送数百 KB 到数 MB，用于打开拥塞窗口。
+- 多流并发 bulk transfer：
+  验证共享拥塞窗口下的发送调度，不把单流结果误判成连接级结果。
+- 应用限速流量：
+  周期性停顿再继续，验证 application-limited 时窗口不被错误扩张。
+- 小窗口流控流量：
+  故意让接收端晚一点发送 `MAX_DATA` / `MAX_STREAM_DATA`，验证 sender 在 flow-control-limited 时的行为。
+- PTO 探针场景：
+  人工丢弃若干关键 ACK 或数据包，验证 sender 会发送 probe，而不是无限等待。
+
+##### 8. 文档与脚本同步要求
+
+- 当前阶段 4 已满足“`test_phase15/16/17` + `topo.py` profile 驱动验证已落地”的完成条件。
+- `topo.py` 当前已经支持 `--profile`、`--bw`、`--delay`、`--loss`；`--queue`、`--ecn` 仍是后续增强项。
+- `example/client.c` / `example/server.c` 当前的文件传输模式已可用于 stage4 bulk 验证；更复杂的持续流量模式仍可作为后续增强项。
 
 阶段 5：实现连接管理与迁移能力。补齐 CID 生命周期、NEW_CONNECTION_ID/RETIRE_CONNECTION_ID 语义、path validation、connection migration、preferred_address、stateless reset、idle timeout、close/error handling、token 与地址验证。完成标志是连接不仅能“建立和传数据”，还能正确处理迁移、关闭和异常路径。
 

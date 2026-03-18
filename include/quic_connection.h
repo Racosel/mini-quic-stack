@@ -108,6 +108,7 @@ typedef struct {
     quic_cid_t original_dcid;
     const quic_version_ops_t *version_ops;
     quic_conn_pn_space_t spaces[QUIC_PN_SPACE_COUNT];
+    quic_recovery_state_t recovery;
     quic_conn_timer_state_t timers[QUIC_CONN_TIMER_COUNT];
     quic_pn_space_id_t last_recv_space;
     quic_conn_event_type_t last_event_type;

@@ -287,6 +287,7 @@ void quic_conn_init(quic_connection_t *conn) {
         quic_queue_init(&conn->spaces[i].in_flight);
         quic_ack_ranges_init(conn->spaces[i].ack_ranges, &conn->spaces[i].ack_range_count);
     }
+    quic_recovery_init(&conn->recovery, 1200);
 }
 
 int quic_conn_install_rx_keys(
@@ -356,7 +357,7 @@ void quic_conn_discard_space(quic_connection_t *conn, quic_pn_space_id_t space_i
     quic_crypto_discard_level(&space->tx_crypto);
     space->rx_keys_ready = 0;
     space->tx_keys_ready = 0;
-    quic_queue_clear(&space->in_flight);
+    quic_recovery_discard_space(&conn->recovery, &space->in_flight, (uint8_t)space_id);
     quic_ack_ranges_init(space->ack_ranges, &space->ack_range_count);
     space->largest_received_packet = 0;
     space->last_received_packet = 0;
