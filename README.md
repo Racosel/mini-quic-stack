@@ -66,6 +66,7 @@
 | 阶段 2 包收发管线 | Handshake、0-RTT、1-RTT、短头包的解析/构造，ACK 生成，Version Negotiation，Retry，服务端放大攻击限制 | RFC 9000, RFC 9001, RFC 9002, RFC 9369 | `src/tls/quic_tls.c`, `src/packet/quic_version.c`, `src/packet/quic_retry.c` | `tests/test_phase13.c` |
 | 阶段 3 流与流控基础 | stream 状态机、发送缓冲、接收重组、FIN/RESET/STOP_SENDING、MAX_DATA/MAX_STREAM_DATA/MAX_STREAMS enforcement、基本调度器 | RFC 9000 | `src/transport/quic_stream.c`, `src/tls/quic_tls.c` | `tests/test_phase14.c` |
 | 最小端到端多流示例 | UDP server/client 建立加密 QUIC 连接、在两个 bidirectional stream 上双向收发应用数据，并交换 1-RTT PING | RFC 9000, RFC 9001 | `example/server.c`, `example/client.c`, `topo.py` | `tests/test_phase12.c`, `tests/test_phase13.c`, `tests/test_phase14.c`, `make quic-demo` |
+| 阶段 6 子阶段 A 应用接口与观测 | 稳定 `quic_api`、qlog 风格事件、基础 metrics、双 stream app demo、阶段 6 自测入口 | RFC 9000, RFC 9001, RFC 9002 | `include/quic_api.h`, `src/app/quic_api.c`, `example/app_client.c`, `example/app_server.c`, `topo.py` | `tests/test_phase21.c`, `tests/test_phase22.c`, `tests/test_phase23.c`, `make quic-app-demo` |
 
 ### 部分实现功能
 
@@ -107,6 +108,9 @@
 - `test12`: 阶段 1 TLS/QUIC 握手核心，覆盖 CRYPTO 重组、transport parameters、Handshake/1-RTT 密钥安装、旧密钥丢弃与内存内端到端握手
 - `test13`: 阶段 2 完整包收发管线，覆盖 ACK 生成、交错时序下的后续 Initial、Retry、Version Negotiation、放大攻击限制、0-RTT 与短头包路径
 - `test14`: 阶段 3 流与流控基础，覆盖多流双向数据传输、MAX_DATA/MAX_STREAM_DATA 增长，以及 STOP_SENDING 触发 RESET_STREAM
+- `test21`: 阶段 6 应用 API 与关闭语义，覆盖稳定应用接口、双 stream 请求/响应和优雅关闭
+- `test22`: 阶段 6 qlog/metrics 与准 fuzz 回归，覆盖事件导出、基础指标采样和包头解析压力回归
+- `test23`: 阶段 6 app demo 本机 loopback，覆盖 `quic_app_server/quic_app_client`、qlog 文件落盘和真实 UDP 请求/响应
 
 运行方式：
 
@@ -518,6 +522,25 @@ sudo python3 topo.py --auto-file --profile lossy-recovery --bw 100 --delay 20 --
 - 阶段 5 完成前，README 中“已完成能力”不应提前宣称迁移或 stateless reset 已实现；只有 `test_phase18/19/20` 与对应 `topo.py` profile 稳定通过后，才能把这一阶段标记为完成。
 
 阶段 6：接应用层与做互操作收尾。最后再接 HTTP/3 或至少一个稳定的应用层 demo，补 qlog/metrics/fuzzing/interop tests，和 quiche、ngtcp2、msquic 这类实现做互通验证。完成标志是仓库不再只是协议构件集合，而是一个可对外使用、可验证、可调试的完整 QUIC 栈。
+
+当前状态：阶段 6 进行中，子阶段 A 已完成。
+
+- 已落地：
+  - `include/quic_api.h` / `src/app/quic_api.c`：稳定应用接口，封装连接创建、收发、stream 读写、timeout 驱动、迁移入口和 close 入口
+  - qlog 风格事件队列与 JSON 导出
+  - 基础 metrics 导出：收发字节、拥塞窗口、在途字节、PTO 计数、活跃 stream/path 数
+  - `example/app_client.c` / `example/app_server.c`：基于 `quic_api` 的最小双 stream 请求/响应 demo
+  - `tests/test_phase21.c` / `tests/test_phase22.c` / `tests/test_phase23.c`
+  - `topo.py` 的 `app-demo-clean` / `app-demo-lossy` profile，以及 `make topo-stage6-clean` / `make topo-stage6-lossy`
+- 已验证：
+  - `make test21 test22`
+  - `make test23`
+  - `make TEST_REPEAT=1 test18 test19 test20`
+  - `python3 -m py_compile topo.py`
+- 尚未完成：
+  - 外部实现 interop（`quiche` / `ngtcp2` / `msquic`）
+  - HTTP/3 / QPACK
+  - 更系统的 fuzz harness（当前只有准 fuzz 回归，不是 libFuzzer 级别）
 
 #### 阶段 6 设计细化
 

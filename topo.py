@@ -27,8 +27,13 @@ SERVER_RECEIVED_FILE = TRANSFER_DIR / "server_received.bin"
 CLIENT_DOWNLOADED_FILE = TRANSFER_DIR / "client_downloaded.bin"
 SERVER_BIN = BIN_DIR / "quic_server"
 CLIENT_BIN = BIN_DIR / "quic_client"
+APP_SERVER_BIN = BIN_DIR / "quic_app_server"
+APP_CLIENT_BIN = BIN_DIR / "quic_app_client"
 SERVER_CERT = CERT_DIR / "server_cert.pem"
 SERVER_KEY = CERT_DIR / "server_key.pem"
+APP_QLOG_DIR = TESTS_ROOT / "data" / "stage6-demo"
+APP_SERVER_QLOG = APP_QLOG_DIR / "server.qlog"
+APP_CLIENT_QLOG = APP_QLOG_DIR / "client.qlog"
 SERVER_READY_MARKER = "server listening on "
 SERVER_READY_TIMEOUT_S = 10.0
 STAGE5_PREFERRED_PORT = 4445
@@ -86,6 +91,22 @@ NETWORK_PROFILES = {
         "server_loss_pct": 0.0,
         "upload_size": 65536,
         "download_size": 49152,
+    },
+    "app-demo-clean": {
+        "description": "阶段 6 app demo 验证：稳定链路上的双 stream 请求/响应与 qlog 导出",
+        "bw_mbit": 100,
+        "client_delay_ms": 20,
+        "server_delay_ms": 10,
+        "client_loss_pct": 0.0,
+        "server_loss_pct": 0.0,
+    },
+    "app-demo-lossy": {
+        "description": "阶段 6 app demo 验证：轻度丢包链路上的双 stream 请求/响应与 qlog 导出",
+        "bw_mbit": 100,
+        "client_delay_ms": 20,
+        "server_delay_ms": 10,
+        "client_loss_pct": 1.0,
+        "server_loss_pct": 0.0,
     },
 }
 
@@ -146,8 +167,13 @@ def build_network(profile: dict):
     return net
 
 
-def ensure_examples_built(repo_root: Path) -> None:
-    subprocess.run(["make", "quic-demo"], cwd=repo_root, check=True)
+def is_app_demo_profile(profile_name: str) -> bool:
+    return profile_name.startswith("app-demo")
+
+
+def ensure_examples_built(repo_root: Path, profile_name: str) -> None:
+    target = "quic-app-demo" if is_app_demo_profile(profile_name) else "quic-demo"
+    subprocess.run(["make", target], cwd=repo_root, check=True)
 
 
 def deterministic_bytes(size: int, seed: int) -> bytes:
@@ -185,6 +211,22 @@ def prepare_file_transfer_case(repo_root: Path, profile: dict) -> dict:
         "download_size": download_source_path.stat().st_size,
         "upload_sha256": sha256_file(upload_path),
         "download_sha256": sha256_file(download_source_path),
+    }
+
+
+def prepare_app_demo_case(repo_root: Path) -> dict:
+    qlog_dir = repo_root / APP_QLOG_DIR
+    client_qlog = repo_root / APP_CLIENT_QLOG
+    server_qlog = repo_root / APP_SERVER_QLOG
+
+    qlog_dir.mkdir(parents=True, exist_ok=True)
+    for reset_path in (client_qlog, server_qlog):
+        if reset_path.exists():
+            reset_path.unlink()
+
+    return {
+        "client_qlog": client_qlog,
+        "server_qlog": server_qlog,
     }
 
 
@@ -283,6 +325,41 @@ def verify_file_transfer_case(case: dict) -> bool:
     return False
 
 
+def file_contains(path: Path, needle: str) -> bool:
+    if not path.exists():
+        return False
+    return needle in path.read_text(encoding="utf-8", errors="replace")
+
+
+def verify_app_demo_case(case: dict) -> bool:
+    client_qlog = case["client_qlog"]
+    server_qlog = case["server_qlog"]
+
+    if not client_qlog.exists():
+        info_error("app demo 校验失败：客户端未生成 qlog")
+        return False
+    if not server_qlog.exists():
+        info_error("app demo 校验失败：服务端未生成 qlog")
+        return False
+
+    info("*** app demo qlog 校验 ***\n")
+    info(f"客户端 qlog: {APP_CLIENT_QLOG}\n")
+    info(f"服务端 qlog: {APP_SERVER_QLOG}\n")
+
+    ok = (
+        file_contains(client_qlog, "\"event\":\"handshake_complete\"") and
+        file_contains(client_qlog, "\"event\":\"connection_close_requested\"") and
+        file_contains(server_qlog, "\"event\":\"handshake_complete\"") and
+        file_contains(server_qlog, "\"event\":\"stream_readable\"")
+    )
+    if ok:
+        info_done("app demo qlog 校验通过")
+        return True
+
+    info_error("app demo qlog 校验失败")
+    return False
+
+
 def print_manual_instructions(repo_root: Path, auto_file_mode: bool, rounds: int, profile: dict, profile_name: str) -> None:
     info("*** 当前进程无 root 权限，无法启动 Mininet ***\n")
     print("请在具备 sudo 权限的终端手动执行以下命令：")
@@ -304,6 +381,11 @@ def print_manual_instructions(repo_root: Path, auto_file_mode: bool, rounds: int
             print(f"  sudo chown -R $USER:$USER {repo_root / (TESTS_ROOT / 'data')}")
     else:
         print(f"  sudo python3 topo.py --auto --profile {profile_name} --rounds {rounds}")
+        if is_app_demo_profile(profile_name):
+            case = prepare_app_demo_case(repo_root)
+            print("已预清理阶段 6 app demo qlog 路径：")
+            print(f"  客户端 qlog: {case['client_qlog']}")
+            print(f"  服务端 qlog: {case['server_qlog']}")
 
 def run_single_auto_validation(net: Mininet,
                                repo_root: Path,
@@ -315,6 +397,7 @@ def run_single_auto_validation(net: Mininet,
     h1 = net.get("h1")
     h2 = net.get("h2")
     case = prepare_file_transfer_case(repo_root, profile) if auto_file_mode else None
+    app_case = prepare_app_demo_case(repo_root) if (not auto_file_mode and is_app_demo_profile(profile_name)) else None
 
     info(f"*** 第 {round_index}/{rounds} 轮自动验证 ({profile_name}: {profile['description']}) ***\n")
     if auto_file_mode:
@@ -329,11 +412,21 @@ def run_single_auto_validation(net: Mininet,
             f"./{CLIENT_BIN} 10.0.0.2 4434 {UPLOAD_FILE} {CLIENT_DOWNLOADED_FILE}{extra_args}"
         )
     else:
-        server_cmd = (
-            f"cd {repo_root} && "
-            f"./{SERVER_BIN} 10.0.0.2 4434 {SERVER_CERT} {SERVER_KEY}"
-        )
-        client_cmd = f"cd {repo_root} && ./{CLIENT_BIN} 10.0.0.2 4434"
+        if is_app_demo_profile(profile_name):
+            server_cmd = (
+                f"cd {repo_root} && "
+                f"./{APP_SERVER_BIN} 10.0.0.2 4434 {SERVER_CERT} {SERVER_KEY} {APP_SERVER_QLOG}"
+            )
+            client_cmd = (
+                f"cd {repo_root} && "
+                f"./{APP_CLIENT_BIN} 10.0.0.2 4434 {APP_CLIENT_QLOG}"
+            )
+        else:
+            server_cmd = (
+                f"cd {repo_root} && "
+                f"./{SERVER_BIN} 10.0.0.2 4434 {SERVER_CERT} {SERVER_KEY}"
+            )
+            client_cmd = f"cd {repo_root} && ./{CLIENT_BIN} 10.0.0.2 4434"
 
     if auto_file_mode:
         info("*** 已准备文件传输测试数据 ***\n")
@@ -403,6 +496,11 @@ def run_single_auto_validation(net: Mininet,
         if ok:
             info_done(f"第 {round_index}/{rounds} 轮自动验证完成")
         return ok
+    if app_case is not None:
+        ok = verify_app_demo_case(app_case)
+        if ok:
+            info_done(f"第 {round_index}/{rounds} 轮自动验证完成")
+        return ok
 
     info_done(f"第 {round_index}/{rounds} 轮自动验证完成")
     return True
@@ -417,7 +515,7 @@ def run_auto_validation(net: Mininet,
     round_index = 1
 
     info("*** 构建 example 与测试证书 ***\n")
-    ensure_examples_built(repo_root)
+    ensure_examples_built(repo_root, profile_name)
     while round_index <= rounds:
         if not run_single_auto_validation(net, repo_root, auto_file_mode, round_index, rounds, profile, profile_name):
             return False

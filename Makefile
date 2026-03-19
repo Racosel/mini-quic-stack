@@ -25,6 +25,7 @@ SRC_CONN = src/transport/quic_connection.c src/recovery/quic_ack.c src/recovery/
 SRC_CRYPTO_STREAM = src/transport/quic_crypto_stream.c
 SRC_STREAM = src/transport/quic_stream.c
 SRC_TLS = src/tls/quic_tls.c $(SRC_CRYPTO_STREAM) $(SRC_STREAM) $(SRC_CONN) src/packet/quic_transport_params.c src/packet/quic_retry.c
+SRC_API = src/app/quic_api.c $(SRC_TLS)
 
 SRC_TEST_PHASE1 = tests/test_phase1.c
 SRC_TEST_PHASE2 = tests/test_phase2.c
@@ -45,6 +46,9 @@ SRC_TEST_PHASE17 = tests/test_phase17.c
 SRC_TEST_PHASE18 = tests/test_phase18.c
 SRC_TEST_PHASE19 = tests/test_phase19.c
 SRC_TEST_PHASE20 = tests/test_phase20.c
+SRC_TEST_PHASE21 = tests/test_phase21.c
+SRC_TEST_PHASE22 = tests/test_phase22.c
+SRC_TEST_PHASE23 = tests/test_phase23.c
 
 BIN_TEST_PHASE1 = $(TEST_BIN_DIR)/test_phase1_bin
 BIN_TEST_PHASE2 = $(TEST_BIN_DIR)/test_phase2_bin
@@ -65,16 +69,21 @@ BIN_TEST_PHASE17 = $(TEST_BIN_DIR)/test_phase17_bin
 BIN_TEST_PHASE18 = $(TEST_BIN_DIR)/test_phase18_bin
 BIN_TEST_PHASE19 = $(TEST_BIN_DIR)/test_phase19_bin
 BIN_TEST_PHASE20 = $(TEST_BIN_DIR)/test_phase20_bin
+BIN_TEST_PHASE21 = $(TEST_BIN_DIR)/test_phase21_bin
+BIN_TEST_PHASE22 = $(TEST_BIN_DIR)/test_phase22_bin
+BIN_TEST_PHASE23 = $(TEST_BIN_DIR)/test_phase23_bin
 BIN_EXAMPLE_SERVER = $(TEST_BIN_DIR)/quic_server
 BIN_EXAMPLE_CLIENT = $(TEST_BIN_DIR)/quic_client
+BIN_APP_SERVER = $(TEST_BIN_DIR)/quic_app_server
+BIN_APP_CLIENT = $(TEST_BIN_DIR)/quic_app_client
 TEST_CERT = $(TEST_CERT_DIR)/server_cert.pem
 TEST_KEY = $(TEST_CERT_DIR)/server_key.pem
-BIN_TESTS = $(BIN_TEST_PHASE1) $(BIN_TEST_PHASE2) $(BIN_TEST_PHASE3) $(BIN_TEST_PHASE4) $(BIN_TEST_PHASE6) $(BIN_TEST_PHASE7) $(BIN_TEST_PHASE8) $(BIN_TEST_PHASE9) $(BIN_TEST_PHASE10) $(BIN_TEST_PHASE11) $(BIN_TEST_PHASE12) $(BIN_TEST_PHASE13) $(BIN_TEST_PHASE14) $(BIN_TEST_PHASE15) $(BIN_TEST_PHASE16) $(BIN_TEST_PHASE17) $(BIN_TEST_PHASE18) $(BIN_TEST_PHASE19) $(BIN_TEST_PHASE20)
+BIN_TESTS = $(BIN_TEST_PHASE1) $(BIN_TEST_PHASE2) $(BIN_TEST_PHASE3) $(BIN_TEST_PHASE4) $(BIN_TEST_PHASE6) $(BIN_TEST_PHASE7) $(BIN_TEST_PHASE8) $(BIN_TEST_PHASE9) $(BIN_TEST_PHASE10) $(BIN_TEST_PHASE11) $(BIN_TEST_PHASE12) $(BIN_TEST_PHASE13) $(BIN_TEST_PHASE14) $(BIN_TEST_PHASE15) $(BIN_TEST_PHASE16) $(BIN_TEST_PHASE17) $(BIN_TEST_PHASE18) $(BIN_TEST_PHASE19) $(BIN_TEST_PHASE20) $(BIN_TEST_PHASE21) $(BIN_TEST_PHASE22) $(BIN_TEST_PHASE23)
 
 
-.PHONY: all test1 test2 test3 test4 test5_1 test6 test7 test8 test9 test10 test11 test12 test13 test14 test15 test16 test17 test18 test19 test20 example-certs quic-server quic-client quic-demo topo-auto topo-auto-file topo-stage4-clean topo-stage4-lossy topo-stage5-preferred clean net
+.PHONY: all test1 test2 test3 test4 test5_1 test6 test7 test8 test9 test10 test11 test12 test13 test14 test15 test16 test17 test18 test19 test20 test21 test22 test23 example-certs quic-server quic-client quic-demo quic-app-server quic-app-client quic-app-demo topo-auto topo-auto-file topo-stage4-clean topo-stage4-lossy topo-stage5-preferred topo-stage6-clean topo-stage6-lossy clean net
 
-all: $(BIN_TEST_PHASE1) $(BIN_TEST_PHASE2) $(BIN_TEST_PHASE3) $(BIN_TEST_PHASE4) $(BIN_TEST_PHASE6) $(BIN_TEST_PHASE7) $(BIN_TEST_PHASE8) $(BIN_TEST_PHASE9) $(BIN_TEST_PHASE10) $(BIN_TEST_PHASE11) $(BIN_TEST_PHASE12) $(BIN_TEST_PHASE13) $(BIN_TEST_PHASE14) $(BIN_TEST_PHASE15) $(BIN_TEST_PHASE16) $(BIN_TEST_PHASE17) $(BIN_TEST_PHASE18) $(BIN_TEST_PHASE19) $(BIN_TEST_PHASE20) $(BIN_EXAMPLE_SERVER) $(BIN_EXAMPLE_CLIENT)
+all: $(BIN_TEST_PHASE1) $(BIN_TEST_PHASE2) $(BIN_TEST_PHASE3) $(BIN_TEST_PHASE4) $(BIN_TEST_PHASE6) $(BIN_TEST_PHASE7) $(BIN_TEST_PHASE8) $(BIN_TEST_PHASE9) $(BIN_TEST_PHASE10) $(BIN_TEST_PHASE11) $(BIN_TEST_PHASE12) $(BIN_TEST_PHASE13) $(BIN_TEST_PHASE14) $(BIN_TEST_PHASE15) $(BIN_TEST_PHASE16) $(BIN_TEST_PHASE17) $(BIN_TEST_PHASE18) $(BIN_TEST_PHASE19) $(BIN_TEST_PHASE20) $(BIN_TEST_PHASE21) $(BIN_TEST_PHASE22) $(BIN_TEST_PHASE23) $(BIN_EXAMPLE_SERVER) $(BIN_EXAMPLE_CLIENT) $(BIN_APP_SERVER) $(BIN_APP_CLIENT)
 
 $(BORINGSSL_LIBS):
 	cmake -S boringssl -B boringssl/build
@@ -231,6 +240,27 @@ $(BIN_TEST_PHASE20): $(SRC_TEST_PHASE20) $(SRC_TLS) $(BORINGSSL_LIBS)
 test20: $(BIN_TEST_PHASE20) example-certs
 	$(call RUN_REPEATED,test20,./$(BIN_TEST_PHASE20))
 
+$(BIN_TEST_PHASE21): $(SRC_TEST_PHASE21) $(SRC_API) $(BORINGSSL_LIBS)
+	mkdir -p $(@D)
+	$(LD) $(CFLAGS) $(INCLUDES) $(SRC_TEST_PHASE21) $(SRC_API) -o $@ $(LDFLAGS)
+
+test21: $(BIN_TEST_PHASE21) example-certs
+	$(call RUN_REPEATED,test21,./$(BIN_TEST_PHASE21))
+
+$(BIN_TEST_PHASE22): $(SRC_TEST_PHASE22) $(SRC_API) $(BORINGSSL_LIBS)
+	mkdir -p $(@D)
+	$(LD) $(CFLAGS) $(INCLUDES) $(SRC_TEST_PHASE22) $(SRC_API) -o $@ $(LDFLAGS)
+
+test22: $(BIN_TEST_PHASE22) example-certs
+	$(call RUN_REPEATED,test22,./$(BIN_TEST_PHASE22))
+
+$(BIN_TEST_PHASE23): $(SRC_TEST_PHASE23)
+	mkdir -p $(@D)
+	$(CC) $(CFLAGS) $(INCLUDES) $(SRC_TEST_PHASE23) -o $@
+
+test23: $(BIN_TEST_PHASE23) example-certs quic-app-demo
+	$(call RUN_REPEATED,test23,./$(BIN_TEST_PHASE23))
+
 SRC_RECOVERY = src/recovery/loss_detector.c
 SRC_TEST_PHASE5_1 = tests/test_phase5_1.c
 BIN_TEST_PHASE5_1 = $(TEST_BIN_DIR)/test_phase5_1_bin
@@ -260,11 +290,25 @@ $(BIN_EXAMPLE_CLIENT): example/client.c $(SRC_TLS) $(BORINGSSL_LIBS)
 	mkdir -p $(@D)
 	$(LD) $(CFLAGS) $(INCLUDES) example/client.c $(SRC_TLS) -o $@ $(LDFLAGS)
 
+$(BIN_APP_SERVER): example/app_server.c $(SRC_API) $(BORINGSSL_LIBS)
+	mkdir -p $(@D)
+	$(LD) $(CFLAGS) $(INCLUDES) example/app_server.c $(SRC_API) -o $@ $(LDFLAGS)
+
+$(BIN_APP_CLIENT): example/app_client.c $(SRC_API) $(BORINGSSL_LIBS)
+	mkdir -p $(@D)
+	$(LD) $(CFLAGS) $(INCLUDES) example/app_client.c $(SRC_API) -o $@ $(LDFLAGS)
+
 quic-server: $(BIN_EXAMPLE_SERVER) example-certs
 
-quic-client: $(BIN_EXAMPLE_CLIENT)
+quic-client: $(BIN_EXAMPLE_CLIENT) example-certs
 
 quic-demo: $(BIN_EXAMPLE_SERVER) $(BIN_EXAMPLE_CLIENT) example-certs
+
+quic-app-server: $(BIN_APP_SERVER) example-certs
+
+quic-app-client: $(BIN_APP_CLIENT) example-certs
+
+quic-app-demo: $(BIN_APP_SERVER) $(BIN_APP_CLIENT) example-certs
 
 topo-auto: quic-demo
 	sudo python3 topo.py --auto --rounds $(TEST_REPEAT)
@@ -280,6 +324,12 @@ topo-stage4-lossy: quic-demo
 
 topo-stage5-preferred: quic-demo
 	sudo python3 topo.py --auto-file --profile preferred-address --rounds $(TEST_REPEAT)
+
+topo-stage6-clean: quic-app-demo
+	sudo python3 topo.py --auto --profile app-demo-clean --rounds $(TEST_REPEAT)
+
+topo-stage6-lossy: quic-app-demo
+	sudo python3 topo.py --auto --profile app-demo-lossy --rounds $(TEST_REPEAT)
 
 # ==========================================
 # 网络与清理

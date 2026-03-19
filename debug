@@ -363,3 +363,42 @@
   - `tests/test_phase19.c`
   - `tests/test_phase20.c`
 - `状态`: 待 `make topo-stage5-preferred` 复验
+
+## Bug 011：Stage 6 初始集成中的构建与测试语义错误
+
+- `时间`: 2026-03-19 10:41:43 +0800
+- `阶段`: 阶段 6 / 应用 API、qlog/metrics、app demo 验证
+- `标题`: `phase22` 与 Makefile 初稿把测试假设和真实状态机语义绑错，导致新阶段首轮回归误报失败
+- `现象`:
+  - `make TEST_REPEAT=1 quic-app-demo test21 test22 test23` 首轮执行时，`test_phase22` 链接失败，提示 `pkt_decode.c` 重复定义
+  - 修完构建后，`test_phase22` 又连续在“等待接收侧 FIN”和“`smoothed_rtt_ms`/`pto_count` 必须非零”这些断言上失败
+  - 这些失败都出现在阶段 6 新增 API、qlog/metrics 与准 fuzz 回归初次接线时，而 `test21` 与本机 loopback app demo 已经能通过
+- `影响`:
+  - 如果不整理清楚，会把测试设计缺陷误判成协议核心回归，放大阶段 6 的排查成本
+  - 会让后续阶段 6 的 5 轮默认回归不稳定，失去“作为开发护栏”的价值
+- `根因`:
+  - `Makefile` 中 `test22` 同时通过 `SRC_API` 和显式 `SRC_PACKET` 再次把 `pkt_decode.c` 链接进来，造成重复定义
+  - `tests/test_phase22.c` 最初把“对端已经完整收到带 FIN 的 stream 数据”错误写成对 `stream->fin_received` 的等待，但当前实现里这个字段和应用消费进度相关，不适合作为未读数据阶段的完成条件
+  - 同一个测试还把 `smoothed_rtt_ms > 0`、`pto_count > 0` 当成硬性稳定信号；在当前内存内驱动和一次性丢包场景下，这些指标并不保证每轮都非零
+- `修复`:
+  - 从 `Makefile` 的 `test22` 规则中移除重复的 `SRC_PACKET`
+  - 把 `phase22` 的数据接收验证改成“边驱动网络边 drain stream，直到应用真正读到 FIN”
+  - 把 metrics 断言收敛到稳定信号：收发字节、拥塞窗口、事件计数，以及事件流里出现 `ping_queued` / `handshake_complete` / `stream_readable`
+  - 保留包头解析的准 fuzz 回归，但不再拿时序敏感的弱指标当成阶段 6 阶段性完成的唯一证据
+  - 修正 `topo.py` 中 `APP_QLOG_DIR` 误引用不存在变量 `TEST_DATA_DIR` 的脚本接线错误，改为使用 `tests/data/stage6-demo`
+- `验证`:
+  - `make test21 test22`
+  - `make test23`
+  - `make TEST_REPEAT=1 test18 test19 test20`
+  - `python3 -m py_compile topo.py`
+  - `python3 topo.py --auto --profile app-demo-clean --rounds 1`
+- `相关文件`:
+  - `Makefile`
+  - `tests/test_phase22.c`
+  - `tests/test_phase23.c`
+  - `include/quic_api.h`
+  - `src/app/quic_api.c`
+  - `example/app_client.c`
+  - `example/app_server.c`
+  - `topo.py`
+- `状态`: 已解决
