@@ -146,6 +146,7 @@ typedef struct {
     uint8_t retire_connection_id_in_flight;
     uint8_t path_control_pending;
     uint8_t path_control_in_flight;
+    uint8_t preferred_migration_pending;
     uint8_t new_token_pending;
     uint8_t new_token_in_flight;
     uint8_t stateless_reset_detected;
@@ -188,6 +189,7 @@ typedef struct {
     size_t pending_issue_cid_index;
     size_t pending_retire_cid_index;
     size_t pending_path_index;
+    size_t preferred_migration_path_index;
     quic_tls_path_t paths[QUIC_TLS_MAX_PATHS];
     quic_tls_cid_state_t local_cids[QUIC_TLS_MAX_CID_POOL];
     quic_tls_cid_state_t peer_cids[QUIC_TLS_MAX_CID_POOL];

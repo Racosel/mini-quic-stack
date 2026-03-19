@@ -299,6 +299,67 @@
   - `tests/test_phase14.c`
   - `tests/test_phase17.c`
   - `topo.py`
-  - `Makefile`
-  - `README.md`
+- `Makefile`
+- `README.md`
 - `状态`: 已解决，用户已完成 20 次 clean-bdp 复验
+
+## Bug 010：Stage 5 preferred-address 真实 UDP 迁移路径被单 connected socket 错误过滤
+
+- `时间`: 2026-03-19 09:35:22 +0800
+- `阶段`: 阶段 5 / preferred-address 迁移 / example 与 topo 真实网络验证
+- `标题`: 客户端示例仍使用 `connect()/send()/recv()` 单 socket 模型，迁移后会把接收侧过滤到错误 path
+- `现象`:
+  - 本机回环启用 preferred-address 时，客户端输出 `client learned preferred address ...`、`client started preferred-address migration` 后超时
+  - 服务端能完成握手，但随后输出 `server timeout waiting for QUIC stream exchange`
+  - `test18`、`test19`、`test20` 都通过，说明协议内存内状态机与 example 的真实 socket 路径行为不一致
+- `影响`:
+  - 阶段 5 无法通过 `example/` 或 `topo-stage5-preferred` 证明迁移后连接仍可继续完成文件传输
+  - 会把真实网络上的 path migration 问题伪装成协议核心问题，干扰后续排查
+- `根因`:
+  - `example/client.c` 在初始路径和迁移后都依赖 `connect()`，并且 `send_pending_packets()` 会按每个待发包重新 `connect()` 到对应 peer
+  - 这意味着发送哪条 path 和接收允许来自哪条 peer 被同一个 socket 的隐式过滤耦合在一起
+  - 在 preferred-address 迁移期间，即使连接对象内部已经按 path 维护状态，example 的真实 socket 仍可能因为最后一次 `connect()` 指向错误 peer，而丢掉另一条 path 上到达的必要包
+  - 这不符合本仓库阶段 5 采用的显式 `quic_path_addr_t` 路径模型，也使 example 与 `tests/test_phase19.c`、`tests/test_phase20.c` 的 path-aware 验证语义不一致
+- `修复`:
+  - 保留客户端最初一次 `connect()`，仅用于获取稳定的本地地址与端口并初始化 `quic_path_addr_t`
+  - 初始化后立刻对 UDP socket 执行 `AF_UNSPEC` 断开
+  - 把客户端正式收发改为 `sendto()/recvfrom()`，并在收包时显式构造 `quic_path_addr_t`
+  - 将入站数据改为调用 `quic_tls_conn_handle_datagram_on_path()`，使 example 与阶段 5 path-aware 核心接口保持一致
+- `后续追加分析`:
+  - 用户随后在 Mininet `preferred-address` profile 中继续复现相同超时，而本机 loopback 已经通过，说明问题不只在 socket 过滤
+  - 对照 `rfc-docs/9000` 第 9.6.2 节，客户端“迁移到 preferred address 之前必须先完成地址验证”，而原来的 `example/client.c` 在 `quic_tls_conn_begin_migration()` 后立刻开始发送文件流与 `PING`，把 non-probing frames 提前发到了尚未完成验证的 preferred path 上
+  - 这在 loopback 上可能被宽松时序掩盖，但在 Mininet 的真实时延环境下更容易卡在“双方都等待后续流量/验证推进”的状态
+  - 继续对照 `rfc-docs/9000` 第 9.1、9.2、9.6.2 节后又发现，问题不仅在 example 何时启动文件流，还在协议层 `quic_tls_conn_begin_migration()` 自身：它会立即切换 `active_path_index`，并且立刻把 `RETIRE_CONNECTION_ID` 这种 non-probing frame 排进待发送队列
+  - 对 preferred-address 来说，这等于在验证成功前就已经“迁移”并开始发送 non-probing traffic，违背 RFC 9000 §9.6.2 的前提
+  - 用户随后贴回的 Mininet timeout dump 进一步说明了另一个 example 层缺陷：客户端已经 `active_path=1` 且两条 path 都是 `VALIDATED`，而服务端停在 `path[1] challenge_in_flight=1 challenge_expected=1`，说明 server 仍在等 preferred path 的 PATH_RESPONSE
+  - 这与 `example/client.c` / `example/server.c` 主循环的超时入口错误一致：它们取的是 `quic_tls_conn_next_timeout_ms()` 暴露的统一 deadline，却错误调用 `quic_tls_conn_on_loss_timeout()`；当 deadline 实际上是 path validation deadline 时，example 会反复走错处理函数，导致验证状态机卡死
+- `追加修复`:
+  - 在 `example/client.c` 中把“已经请求迁移”和“迁移路径已经验证成功”分开建模
+  - 客户端收到 `preferred_address` 后只先发 probing 流量启动 path validation，不再立刻开启 stream 0/4 的业务数据
+  - 只有当客户端当前 `active_path_index` 已经是 `peer.port == preferred_port` 且状态为 `QUIC_TLS_PATH_VALIDATED` 时，才开始业务流量与文件传输
+  - 在 `src/tls/quic_tls.c` 和 `include/quic_tls.h` 中增加 `preferred_migration_pending` / `preferred_migration_path_index`
+  - `quic_tls_conn_begin_migration()` 在 `use_preferred_address=1` 时不再立即切换 `active_path_index`，并延后 `RETIRE_CONNECTION_ID`
+  - 待 `PATH_RESPONSE` 使 preferred path 真正验证成功时，才在 `quic_tls_mark_path_validated()` 中提交 active path 切换，并释放延后的 `RETIRE_CONNECTION_ID`
+  - 在 `tests/test_phase19.c` 中增加回归断言：preferred-address 验证成功前，active path 仍保持原始 server 地址，且 `retire_connection_id_pending == 0`
+  - 在 `example/client.c` / `example/server.c` 中补充失败态 path dump，便于后续如果仍有 Mininet 差异时直接读取 active/pending path 与 path control 状态
+  - 继续修正 `example/client.c` / `example/server.c` 的主循环，使其在到达 `quic_tls_conn_next_timeout_ms()` 时统一调用 `quic_tls_conn_on_timeout()`，而不是错误地把 path validation/idle deadline 当成 loss timeout
+- `验证`:
+  - `make TEST_REPEAT=1 test18 test19 test20 quic-demo`
+  - `make test18 test19 test20`
+  - 本机 preferred-address 文件传输回环连续 5 轮通过，`client=0 server=0`
+  - `python3 -m py_compile topo.py`
+- `追加验证`:
+  - `make TEST_REPEAT=1 test18 test19 test20 quic-demo`
+  - 本机 preferred-address 大文件回环（`65536/49152`）通过
+  - `make TEST_REPEAT=1 test19 test20 quic-demo`
+  - 本机 preferred-address 大文件回环再次通过；当前手工回环使用的测试文件规模为 `131072/98304`，也通过
+  - 用户贴回 Mininet timeout dump 后，已再次执行 `make TEST_REPEAT=1 test19 test20 quic-demo`
+  - 本机 preferred-address 大文件回环（`65536/49152`）再次通过
+- `相关文件`:
+  - `example/client.c`
+  - `example/server.c`
+  - `include/quic_tls.h`
+  - `src/tls/quic_tls.c`
+  - `tests/test_phase19.c`
+  - `tests/test_phase20.c`
+- `状态`: 待 `make topo-stage5-preferred` 复验

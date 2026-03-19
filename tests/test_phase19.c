@@ -319,9 +319,15 @@ static void test_stage5_preferred_address_migration_uses_announced_server_addres
     run_until(&client, &server, handshake_done);
     assert(quic_tls_conn_get_peer_preferred_address(&client, &preferred_path, NULL, NULL) == 0);
     assert(quic_tls_conn_begin_migration(&client, &preferred_path, 1) == 0);
+    assert(client.preferred_migration_pending == 1);
+    assert(client.preferred_migration_path_index < client.path_count);
+    assert(client.paths[client.preferred_migration_path_index].addr.peer.port == 4445);
+    assert(client.paths[client.active_path_index].addr.peer.port == 4434);
+    assert(client.retire_connection_id_pending == 0);
     run_until(&client, &server, preferred_path_validated);
 
     assert(client.paths[client.active_path_index].addr.peer.port == 4445);
+    assert(client.preferred_migration_pending == 0);
 
     quic_tls_conn_free(&client);
     quic_tls_conn_free(&server);

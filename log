@@ -287,3 +287,11 @@
 [2026-03-19 00:19:29 +0800] 已补齐example与topo的阶段5入口：example支持preferred-address迁移后的真实UDP收发，topo新增preferred-address profile与Makefile目标，开始进行本机回环验证。
 [2026-03-19 00:20:14 +0800] 本机回环验证前检查tests/bin、tests/certs、tests/data/topo-transfer产物齐全，继续执行stage5 preferred-address文件传输示例。
 [2026-03-19 00:32:42 +0800] 按用户要求暂停推理并刷新根目录 break：已将断点上下文切换到当前阶段5状态，记录已完成的协议能力、已通过测试、preferred-address 真实UDP剩余问题及下一步推荐修复顺序。
+[2026-03-19 09:35:22 +0800] 从 break 恢复阶段5后确认：用户口述为“阶段4”，但断点与 README 实际对应阶段5；已继续按 preferred-address 真实UDP迁移问题推进，不回退到已完成的阶段4。
+[2026-03-19 09:35:22 +0800] 已修复阶段5真实迁移 bug：example/client.c 改为“初始 connect 仅用于获取本地地址，随后 AF_UNSPEC 断开，并使用 sendto/recvfrom + quic_tls_conn_handle_datagram_on_path 显式传递 path”；make test18 test19 test20 默认5轮通过，本机 preferred-address 文件传输 loopback 连续5轮通过，break/debug 已刷新到“只剩 topo-stage5-preferred 复验”状态。
+[2026-03-19 09:41:33 +0800] 收到用户贴回的 Mininet preferred-address 失败输出：双方握手完成后在 stream exchange 超时。已按 rfc-docs/9000 第9.6.2节重新审视阶段5 example 迁移语义，开始区分“已请求迁移”与“客户端 preferred path 已验证完成”。
+[2026-03-19 09:45:05 +0800] 已按 RFC 9000 §9.6.2 收紧 example/client.c：客户端对 preferred_address 先只做 probing/path validation，待 active path 切换到 validated preferred port 后才开始发送非 probing 的业务流量；阶段5单测仍通过，本机 preferred-address 大文件回环（65536/49152）通过，等待用户复跑 Mininet。
+[2026-03-19 09:54:22 +0800] 继续对照 rfc-docs/9000 第9.1/9.2/9.6.2 收敛阶段5迁移问题：发现协议层 begin_migration(use_preferred_address=1) 也会过早切 active path 并提前排队 RETIRE_CONNECTION_ID，这同样属于验证前发送 non-probing traffic。已在 quic_tls 中新增 preferred_migration_pending 状态，延后 active path 切换与 RETIRE_CONNECTION_ID，test_phase19 增加对应回归；同时在 example client/server timeout 路径补了 path 状态 dump，quic-demo 可重编译通过。
+[2026-03-19 09:59:17 +0800] 收到用户贴回的 Mininet timeout dump：客户端已完成 preferred path 验证，服务端卡在 preferred path 的 challenge_in_flight/expected。已定位为 example 主循环把统一 timeout deadline 错误送入 quic_tls_conn_on_loss_timeout()；现已改为使用 quic_tls_conn_on_timeout() 统一处理 path validation、idle 与 loss timeout，阶段5单测与本机 preferred-address 大文件回环再次通过。
+[2026-03-19 10:05:15 +0800] 按用户要求更新两个本地 skill：新增“本机测试失败时可在失败/超时打印中补充高信号调试信息以便下轮定位”以及“及时同步 README 中任务边界、完成度、验证方式和测试进度”的规则。
+[2026-03-19 10:09:48 +0800] 按用户要求只更新 README：已为阶段6补充正式“设计细化”章节，覆盖设计边界、模块划分、实现顺序、test_phase21/22/23 测试分层、topo/interop profile 与文档脚本同步要求；本轮未编写代码、未运行功能测试。

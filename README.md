@@ -519,4 +519,150 @@ sudo python3 topo.py --auto-file --profile lossy-recovery --bw 100 --delay 20 --
 
 阶段 6：接应用层与做互操作收尾。最后再接 HTTP/3 或至少一个稳定的应用层 demo，补 qlog/metrics/fuzzing/interop tests，和 quiche、ngtcp2、msquic 这类实现做互通验证。完成标志是仓库不再只是协议构件集合，而是一个可对外使用、可验证、可调试的完整 QUIC 栈。
 
-如果你要更可执行一点，我下一步可以把这 7 个阶段继续展开成“每阶段需要新增哪些 .c/.h 文件、哪些测试目标、哪些 RFC 小节对应到哪些实现任务”的开发计划。
+#### 阶段 6 设计细化
+
+阶段 6 的目标不是再补一个“能跑通示例”的薄封装，而是把前 5 个阶段已经形成的 QUIC transport、TLS、恢复、流和迁移能力，提升成可长期验证、可定位、可与外部实现对齐的产品级栈。当前仓库内的 `rfc-docs/` 只覆盖 RFC 9000、9001、9002、9369，因此本阶段与 QUIC transport/TLS/recovery 相关的行为仍以这些文档为基线；如果进入 HTTP/3/QPACK 子阶段，则应先把对应 RFC 文本补入仓库，再开始实现。
+
+##### 1. 设计边界
+
+- 本阶段优先交付“稳定的应用层接入能力 + 可观测性 + 互操作验证”，不要把新的 transport 特性和应用层集成混在同一轮里推进。
+- 应先区分两个子目标，而不是直接把“接 HTTP/3”当成唯一选项：
+  - 子阶段 A：基于现有 QUIC stream API 做一个稳定的应用层 demo，证明对外接口、错误处理、关闭路径和长连接收发已经可用。
+  - 子阶段 B：在子阶段 A 稳定后，再评估引入 HTTP/3 所需的 RFC、控制流、QPACK 和互操作矩阵。
+- 阶段 6 不应继续大幅改写阶段 4/5 的协议主体；如果发现 transport 层缺口，应先回补相应阶段的完成条件，再继续往应用层堆功能。
+- 可观测性、fuzzing 和 interop 不是“收尾可选项”，而是本阶段完成定义的一部分；缺少这些能力时，即使 demo 能跑，也不能算完整 QUIC 栈。
+
+##### 2. 建议的模块划分
+
+- 在 transport 之上明确一层稳定的应用接口，至少抽象出：
+  - 连接创建与销毁
+  - 打开 stream / 接收 stream 事件
+  - 发送数据、读取数据、发送 FIN、接收 RESET/STOP_SENDING
+  - 连接级错误、流级错误、迁移/关闭事件回调
+- 不要让 `example/client.c` / `example/server.c` 继续直接承担“协议核心 + 应用流程 + 调试脚本出口”三种职责。建议拆分出：
+  - `src/app/`：最小应用接入层或 demo 协议层
+  - `include/quic_api.h`：面向应用的稳定接口
+  - `src/observe/`：qlog、metrics、调试事件导出
+  - `tests/fuzz/`：面向包解析、frame 解析、stream 重组和状态机的 fuzz harness
+- 如果后续进入 HTTP/3，建议再单独拆：
+  - `src/http3/`
+  - `include/http3.h`
+  - `tests/interop/`
+
+##### 3. 推荐的实现顺序
+
+1. 先稳定对外 API，而不是先做 HTTP/3：
+   - 明确应用如何创建连接、如何轮询事件、如何读写流、如何感知 close/timeout/migration。
+   - 明确哪些错误属于连接错误，哪些只影响单个流。
+2. 在稳定 API 之上实现一个可长期回归的应用层 demo：
+   - 最小请求/响应协议，或更完整的文件传输/命令响应 demo。
+   - 必须覆盖双向 stream、多个并发 stream、优雅关闭与错误关闭。
+3. 再补可观测性：
+   - qlog 风格事件
+   - 关键指标导出：RTT、cwnd、bytes in flight、PTO 次数、丢包次数、流控阻塞次数、迁移事件
+   - 自动化失败时保留足够高信号的状态输出
+4. 再补 fuzzing：
+   - 包头解析
+   - frame 解析
+   - transport parameters 编解码
+   - ACK range 处理
+   - stream 重组与 final size 相关状态机
+5. 最后补 interop：
+   - 先做“我方 client/外部 server”和“外部 client/我方 server”的 smoke test
+   - 再做带文件传输或多 stream 的更强互通测试
+6. 只有在上述能力稳定后，才进入 HTTP/3：
+   - 先引入所需 RFC 文本
+   - 再增加控制流、单向流、QPACK 与 HTTP/3 错误码
+
+##### 4. 测试设计
+
+阶段 6 建议仍按 3 层验证，不要只依赖一次 `topo.py`。
+
+第一层：面向应用 API 和关闭语义的单元/集成测试，建议新增 `tests/test_phase21.c`
+
+- 验证应用接口的最小稳定语义：
+  - 打开双向和单向 stream 的返回值与状态变化
+  - 应用读到 `FIN` 后的终态
+  - `RESET_STREAM` / `STOP_SENDING` 传递到应用层的可见行为
+  - 应用主动关闭连接与被动收到 `CONNECTION_CLOSE` 的差异
+  - 迁移、idle timeout、stateless reset 事件是否能以一致的方式上报给应用
+
+第二层：可观测性与 fuzzing 回归，建议新增 `tests/test_phase22.c`
+
+- qlog/metrics 至少要验证：
+  - 握手完成
+  - stream 打开/关闭
+  - ACK / loss / PTO
+  - flow-control-limited
+  - path validation / migration
+  - connection close
+- fuzzing 入口至少应覆盖：
+  - 长头/短头包头解析
+  - frame 解码
+  - transport parameters
+  - ACK range
+  - CRYPTO / STREAM 重组
+- 如果暂时没有引入真正的 libFuzzer，也应先用定制回归输入集做“准 fuzz”解析压力测试。
+
+第三层：真实网络与互操作验证，建议新增 `tests/test_phase23.c` 与 `topo.py` 的 stage6 profile
+
+- 这里不只验证“我方 client/server 彼此可通”，还要覆盖：
+  - 长时间 bulk 传输中的稳定性
+  - 多 stream 并发请求/响应
+  - 迁移后继续执行业务流量
+  - 关闭、超时、错误码与日志/指标的一致性
+  - 与至少一种外部实现的基本握手和数据收发互通
+- 互操作验证应明确区分：
+  - transport 互通
+  - 应用层 demo 互通
+  - HTTP/3 互通（如果本阶段后半引入）
+
+##### 5. 是否需要改动网络拓扑
+
+阶段 6 不一定需要比阶段 5 更复杂的基础拓扑，但测试维度要更丰富。
+
+- 对应用层 demo、qlog 和 metrics 验证，当前两主机拓扑仍然足够。
+- 对 interop，`topo.py` 需要允许：
+  - 只启用稳定 path，避免把 interop 问题和迁移问题混在一起
+  - 配置更长的持续传输时间和更大的文件
+  - 选择不同 profile：稳定链路、轻度丢包链路、迁移链路
+- 如果后续要测 HTTP/3 或更真实的应用行为，再考虑新增：
+  - 第三主机产生 cross traffic
+  - 反向流量更强的双向请求/响应模式
+
+##### 6. 推荐的 stage6 profile 与流量特征
+
+建议至少准备以下 profile：
+
+- `app-demo-clean`：
+  - 无丢包、稳定 RTT，用于验证应用接口和业务收发逻辑本身。
+- `app-demo-lossy`：
+  - 低到中等丢包，用于验证应用层不会把恢复期误判为协议失败。
+- `interop-clean`：
+  - 稳定链路，优先排查互操作协议差异。
+- `interop-migration`：
+  - 在 transport 互通已经稳定后，再验证迁移事件不会打断应用层。
+
+阶段 6 的流量特征不应再局限于单次上传/下载：
+
+- 长连接上的多轮请求/响应
+- 至少两个并发 stream 的双向业务数据
+- 应用层主动关闭与异常关闭
+- 迁移发生前后同一业务会话持续收发
+- 如果进入 HTTP/3，则增加控制流、请求流、响应体和头阻塞相关场景
+
+##### 7. 文档与脚本同步要求
+
+- `README.md` 需要同步维护：
+  - 对外 API 简介
+  - 示例运行方式
+  - qlog/metrics/fuzzing/interop 的验证入口
+  - 当前已支持的应用层能力和未支持能力
+- `topo.py` 需要预留 stage6 参数，例如：
+  - `--app-mode`
+  - `--interop-peer`
+  - `--transfer-size`
+  - `--request-count`
+  - `--enable-qlog`
+- `example/` 不应只输出一句“成功/失败”，而要在失败时给出对应用层和 transport 层都有帮助的高信号状态。
+- 阶段 6 完成前，README 中“已完成能力”不应提前宣称“HTTP/3 已实现”或“已完成全面互操作”；只有 `test_phase21/22/23` 与对应 `topo.py` profile、至少一种外部实现的互通验证稳定通过后，才能把这一阶段标记为完成。

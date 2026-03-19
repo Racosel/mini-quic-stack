@@ -1,15 +1,15 @@
 # 中断记录
 
-- `时间`: [2026-03-19 00:32:42 +0800]
+- `时间`: [2026-03-19 09:35:22 +0800]
 - `阶段`: 阶段 5 / RFC 9000、RFC 9001 连接管理、CID 生命周期、迁移与终止
 - `原因`: 用户要求立即暂停推理，并把当前上下文固化到根目录，便于之后从断点继续
 
 ## 当前目标
 
-继续完成阶段 5 的真实端到端验证，当前尚未收口的是：
+继续完成阶段 5 的真实端到端验证，当前只剩最后一层真实拓扑闭环：
 
-- `preferred-address` 迁移后的 `example/` 真 UDP 文件传输仍会超时
-- 对应的 `topo-stage5-preferred` 还没有完成闭环验证
+- `preferred-address` 的本机 loopback 文件传输已经修通
+- `topo-stage5-preferred` 仍未做 root 环境复验
 
 本阶段设计与实现必须继续严格对照：
 
@@ -67,6 +67,7 @@
 - `make TEST_REPEAT=1 test19`
 - `make TEST_REPEAT=1 test20`
 - `make TEST_REPEAT=1 test18 test19 test20`
+- `make test18 test19 test20`
 
 ### 已确认未破坏的旧路径
 
@@ -123,64 +124,32 @@
 
 这对真实 socket 发送方向是错误的，已移除。
 
-## 当前未收口的问题
+### 已收口的问题
 
-### 症状
+此前本机真实 UDP 回环、启用 preferred-address 迁移时，会出现：
 
-在本机真实 UDP 回环、启用 preferred-address 迁移时：
+- 客户端学到 preferred address 并开始迁移后超时
+- 服务端握手完成后也一直等不到 stream exchange
 
-- 服务端能完成握手
-- 客户端能学到 preferred address
-- 客户端会开始迁移
-- 但后续 stream exchange 超时
+这个问题已经修复，根因与方案如下：
 
-失败输出形态为：
-
-- 客户端：
-  - `client learned preferred address port=4445`
-  - `client started preferred-address migration`
-  - `client timeout waiting for QUIC stream exchange`
-- 服务端：
-  - `server listening on 127.0.0.1:4434 (preferred 4445)`
-  - `server handshake complete and preferred-address mode is active`
-  - `server timeout waiting for QUIC stream exchange`
-
-### 当前判断
-
-问题已经从协议单元逻辑收敛到“真实 socket 迁移路径”：
-
-- 非迁移模式 example 正常
-- `test18/19/20` 正常
-- 仅 preferred-address 真 UDP 路径超时
-
-最可能的方向是：
-
-1. 客户端当前仍使用“connected UDP socket + recv()”语义，不利于迁移期间同时接收旧地址和新地址的数据报
-2. 客户端在切到 preferred port 后，仍可能丢掉从旧端口到达的必要握手后续包或 ACK
-3. 真正需要的是像服务端一样改成基于 `sendto()/recvfrom()` 的 path-aware 收发，而不是继续依赖单目标 `connect()`
+- 根因：`example/client.c` 使用单个 connected UDP socket，并在 `send_pending_packets()` 内按每个包反复 `connect()`；发送 path 与接收 peer 过滤被错误耦合
+- 修复：只保留最初一次 `connect()` 用于获取本地地址，随后 `AF_UNSPEC` 断开，并改为 `sendto()/recvfrom()` + `quic_tls_conn_handle_datagram_on_path()`
+- 结果：本机 preferred-address 文件传输 loopback 已连续 5 轮通过
 
 ## 下一步推荐顺序
 
-1. 优先改 `example/client.c`
-   - 从 `connect()/send()/recv()` 主路径改为 `sendto()/recvfrom()`
-   - 收包时构造 `quic_path_addr_t`
-   - 调 `quic_tls_conn_handle_datagram_on_path()`
-   - 保证迁移期间既能接收旧 path，也能接收 preferred path
-
-2. 再检查 `example/server.c`
-   - 确认 preferred socket 与 primary socket 的收发切换是否与 `active_path_index` 一致
-   - 如有必要，补更清晰的 path 调试信息，但最终收尾前要去掉临时 debug 输出
-
-3. 修完后先跑本机回环
-   - `preferred-address` loopback example
-
-4. 本机回环通过后再跑真实拓扑
+1. 在 root 环境执行真实拓扑验证
    - `make topo-stage5-preferred`
 
-5. 收尾
-   - 更新 `debug`
-   - 更新 `README.md`
-   - 更新 `log`
+2. 如果拓扑通过
+   - 更新 `README.md`，把阶段 5 标记为完成
+   - 评估是否保留 `example/client.c` 与 `example/server.c` 的临时调试输出
+   - 更新 `debug` 与 `log`
+
+3. 如果拓扑失败
+   - 优先看 client/server 输出是否再次出现 path 迁移相关超时
+   - 再检查 `example/server.c` 的 preferred socket 收发是否与 `active_path_index` 一致
 
 ## 当前值得注意的文件
 
@@ -197,10 +166,11 @@
 - `topo.py`
 - `Makefile`
 
-### 可能还需要继续调整
+### 仍可能继续调整
 
-- `example/client.c`
 - `example/server.c`
+- `README.md`
+- `topo.py`
 
 ## 当前实现中的临时调试痕迹
 
@@ -214,4 +184,4 @@
 
 ## 一句话状态
 
-阶段 5 的协议核心与单元测试已经基本完成，真正剩下的是 `preferred-address` 在真实 UDP/example/topo 路径上的迁移收尾，首要突破口是把客户端改成真正 path-aware 的 `sendto()/recvfrom()` 收发模型。
+阶段 5 的协议核心、单元测试和本机 preferred-address loopback 都已经通过；当前唯一未闭环的是 `make topo-stage5-preferred` 的真实拓扑复验。

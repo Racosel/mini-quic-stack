@@ -1,2 +1,2 @@
-tests/bin/*
-tests/data/*
+/tests/bin/*
+/tests/data/*

@@ -502,6 +502,14 @@ static void quic_tls_mark_path_validated(quic_tls_conn_t *conn, size_t path_inde
     path->mtu_validated = 1;
     conn->active_path_index = path_index;
     conn->tx_path_index = path_index;
+    if (conn->preferred_migration_pending &&
+        conn->preferred_migration_path_index == path_index) {
+        conn->preferred_migration_pending = 0;
+        conn->preferred_migration_path_index = SIZE_MAX;
+        if (conn->pending_retire_sequence != UINT64_MAX) {
+            conn->retire_connection_id_pending = 1;
+        }
+    }
     if (conn->role == QUIC_ROLE_SERVER) {
         conn->peer_address_validated = 1;
         conn->amplification_blocked = 0;
@@ -3352,6 +3360,8 @@ void quic_tls_conn_init(quic_tls_conn_t *conn) {
     conn->initial_max_stream_data_uni = 16384;
     conn->initial_max_streams_bidi = 4;
     conn->initial_max_streams_uni = 4;
+    conn->pending_retire_sequence = UINT64_MAX;
+    conn->preferred_migration_path_index = SIZE_MAX;
     for (i = 0; i <= ssl_encryption_application; i++) {
         quic_crypto_recvbuf_init(&conn->levels[i].recv);
         quic_crypto_sendbuf_init(&conn->levels[i].send);
@@ -4201,12 +4211,17 @@ void quic_tls_conn_on_timeout(quic_tls_conn_t *conn, uint64_t now_ms) {
                     break;
                 }
             }
-            if (!found_validated) {
-                quic_tls_set_error(conn, "no viable validated path remains");
-                conn->conn.state = QUIC_CONN_STATE_CLOSED;
-                return;
-            }
+        if (!found_validated) {
+            quic_tls_set_error(conn, "no viable validated path remains");
+            conn->conn.state = QUIC_CONN_STATE_CLOSED;
+            return;
         }
+        if (conn->preferred_migration_pending &&
+            conn->preferred_migration_path_index == i) {
+            conn->preferred_migration_pending = 0;
+            conn->preferred_migration_path_index = SIZE_MAX;
+        }
+    }
     }
 
     quic_tls_conn_on_loss_timeout(conn, now_ms);
@@ -4308,14 +4323,19 @@ int quic_tls_conn_begin_migration(quic_tls_conn_t *conn, const quic_path_addr_t 
         return quic_tls_fail(conn, "no spare peer connection id for migration");
     }
 
-    conn->active_path_index = index;
-    conn->tx_path_index = index;
     conn->active_peer_cid_index = selected_peer_index;
     conn->peer_cid = conn->peer_cids[selected_peer_index].cid;
     conn->peer_cid_known = 1;
     if (old_peer_sequence != UINT64_MAX) {
         conn->pending_retire_sequence = old_peer_sequence;
-        conn->retire_connection_id_pending = 1;
+        conn->retire_connection_id_pending = use_preferred_address ? 0 : 1;
+    }
+    if (use_preferred_address) {
+        conn->preferred_migration_pending = 1;
+        conn->preferred_migration_path_index = index;
+    } else {
+        conn->active_path_index = index;
+        conn->tx_path_index = index;
     }
     if (quic_tls_prepare_path_challenge(conn, index, 1) != 0) {
         return quic_tls_fail(conn, "failed to queue migration path challenge");

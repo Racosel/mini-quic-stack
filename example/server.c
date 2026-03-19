@@ -302,6 +302,42 @@ static int server_close_complete(const quic_tls_conn_t *conn) {
             conn->conn.state == QUIC_CONN_STATE_CLOSED);
 }
 
+static void dump_conn_state(const char *label, const quic_tls_conn_t *conn) {
+    size_t i;
+
+    if (!label || !conn) {
+        return;
+    }
+    fprintf(stderr,
+            "%s state=%d handshake=%u active_path=%zu pending_path=%zu preferred_pending=%u "
+            "has_output=%d retire_pending=%u path_control_pending=%u\n",
+            label,
+            (int)conn->conn.state,
+            conn->handshake_complete,
+            conn->active_path_index,
+            conn->pending_path_index,
+            conn->preferred_migration_pending,
+            quic_tls_conn_has_pending_output(conn),
+            conn->retire_connection_id_pending,
+            conn->path_control_pending);
+    for (i = 0; i < conn->path_count; i++) {
+        const quic_tls_path_t *path = &conn->paths[i];
+
+        fprintf(stderr,
+                "  path[%zu] state=%u challenge_pending=%u challenge_in_flight=%u "
+                "challenge_expected=%u response_pending=%u response_in_flight=%u local_port=%u peer_port=%u\n",
+                i,
+                path->state,
+                path->challenge_pending,
+                path->challenge_in_flight,
+                path->challenge_expected,
+                path->response_pending,
+                path->response_in_flight,
+                path->addr.local.port,
+                path->addr.peer.port);
+    }
+}
+
 int main(int argc, char **argv) {
     const char *bind_ip = "10.0.0.2";
     const char *cert_file = DEFAULT_CERT;
@@ -501,7 +537,7 @@ int main(int argc, char **argv) {
         struct pollfd pfds[2];
         nfds_t poll_count = preferred_fd >= 0 ? 2U : 1U;
         int timeout_ms = 50;
-        uint64_t loss_deadline = quic_tls_conn_loss_deadline_ms(&conn);
+        uint64_t next_deadline = quic_tls_conn_next_timeout_ms(&conn);
         uint64_t now = now_ms();
 
         if (server_app_data_complete(&conn,
@@ -540,12 +576,12 @@ int main(int argc, char **argv) {
             }
         }
 
-        if (loss_deadline != 0 && loss_deadline <= now) {
-            quic_tls_conn_on_loss_timeout(&conn, loss_deadline);
+        if (next_deadline != 0 && next_deadline <= now) {
+            quic_tls_conn_on_timeout(&conn, next_deadline);
             continue;
         }
-        if (loss_deadline != 0 && loss_deadline > now) {
-            uint64_t remaining = loss_deadline - now;
+        if (next_deadline != 0 && next_deadline > now) {
+            uint64_t remaining = next_deadline - now;
             if (remaining < (uint64_t)timeout_ms) {
                 timeout_ms = (int)remaining;
             }
@@ -792,6 +828,7 @@ int main(int argc, char **argv) {
     }
 
     fprintf(stderr, "server timeout waiting for QUIC stream exchange\n");
+    dump_conn_state("server-timeout", &conn);
     close(fd);
     quic_tls_conn_free(&conn);
     byte_buffer_free(&request0);
