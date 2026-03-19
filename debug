@@ -290,6 +290,7 @@
   - `python3 -m py_compile topo.py`
   - `python3 topo.py --auto-file --profile clean-bdp --rounds 1` 可正确输出无 root 手动接管指令
   - 用户执行 `make topo-stage4-clean` 等价路径共 20 次，未再复现 `clean-bdp` 超时
+  - 用户继续完成 `make topo-stage4-lossy`、`python3 topo.py --auto-file --profile app-limited --rounds 20` 与 `make test12 test13 test14 test15 test16 test17`，均正常
 - `相关文件`:
   - `include/quic_recovery.h`
   - `include/quic_stream.h`

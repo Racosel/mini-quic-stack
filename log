@@ -276,3 +276,14 @@
 [2026-03-18 23:01:26 +0800] clean-bdp 新根因修复后，test12-17单轮通过，test14-17默认5轮通过；已将 Bug 009 追加为控制帧/data stream 元数据污染并标记为待复验。
 [2026-03-18 23:01:57 +0800] 已整理 Bug 009：合并发送状态过早提交与控制帧stream元数据覆盖两类根因，补记 test_phase14 回归文件。
 [2026-03-18 23:05:30 +0800] 用户反馈 clean-bdp 连续20次未复现，已将 Bug 009 标记为已解决并补充复验记录。
+[2026-03-18 23:07:58 +0800] 用户已完成 topo-stage4-lossy、app-limited 与 test12-test17 回归，反馈均正常；阶段4验证闭环完成。
+[2026-03-18 23:09:33 +0800] 收到阶段5文档整理请求：开始对照 README 与 rfc-docs 梳理连接管理、CID 生命周期、迁移、stateless reset 与 token/path validation 的计划。
+[2026-03-18 23:11:52 +0800] 已更新 README：新增阶段5设计细化，覆盖边界、CID/path/token/termination 模块划分、实现顺序、test_phase18-20 设计、拓扑与 profile 需求；本轮未改协议代码。
+[2026-03-18 23:14:20 +0800] 开始阶段5实现：先检查现有连接对象、TLS收发、example与topo.py中CID/path/token/termination的切入点，并准备按README计划分块落地。
+[2026-03-18 23:36:51 +0800] 阶段5核心接口已接入到quic_tls头文件与主状态机，开始编译现有阶段3/4测试以尽早暴露编译断口。
+[2026-03-18 23:47:30 +0800] 继续阶段5实现，恢复断点后优先编译并调试test18/test19/test20，随后做test12-test20回归与example/topo验证。
+[2026-03-18 23:50:27 +0800] test18通过，覆盖preferred_address、NEW_TOKEN、协商idle timeout与stateless reset；继续编译并调试test19，当前在迁移测试中触发“no datagram pending”。
+[2026-03-19 00:05:04 +0800] 修复阶段5迁移验证中的两处核心问题：PATH控制待发送判定与构包状态不一致、PATH_CHALLENGE等待响应状态错误复用in_flight；test19已通过，继续执行test20集成测试。
+[2026-03-19 00:19:29 +0800] 已补齐example与topo的阶段5入口：example支持preferred-address迁移后的真实UDP收发，topo新增preferred-address profile与Makefile目标，开始进行本机回环验证。
+[2026-03-19 00:20:14 +0800] 本机回环验证前检查tests/bin、tests/certs、tests/data/topo-transfer产物齐全，继续执行stage5 preferred-address文件传输示例。
+[2026-03-19 00:32:42 +0800] 按用户要求暂停推理并刷新根目录 break：已将断点上下文切换到当前阶段5状态，记录已完成的协议能力、已通过测试、preferred-address 真实UDP剩余问题及下一步推荐修复顺序。

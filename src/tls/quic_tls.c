@@ -7,6 +7,7 @@
 #include "quic_retry.h"
 #include "quic_varint.h"
 #include <openssl/err.h>
+#include <openssl/rand.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -17,6 +18,7 @@
 #define QUIC_STREAM_MAX_OFFSET ((1ULL << 62) - 1)
 #define QUIC_TLS_STREAM_PACKET_RESERVE 64
 #define QUIC_TLS_CLOSE_TIMEOUT_MS (QUIC_TLS_RETRANSMIT_TIMEOUT_MS * 3ULL)
+#define QUIC_TLS_STATELESS_RESET_MIN_LEN 21U
 
 static const uint8_t quic_tls_alpn[] = { 0x07, 'a', 'i', '-', 'q', 'u', 'i', 'c' };
 
@@ -69,6 +71,502 @@ typedef struct {
     uint8_t max_streams_uni_in_flight;
     quic_tls_app_stream_snapshot_t streams[QUIC_STREAM_MAX_COUNT];
 } quic_tls_app_send_snapshot_t;
+
+static uint64_t quic_tls_now_ms(void);
+static int quic_tls_build_new_token(const quic_tls_conn_t *conn,
+                                    uint8_t *out,
+                                    size_t out_len,
+                                    size_t *written);
+
+static uint16_t quic_read_u16_be(const uint8_t *data) {
+    return (uint16_t)(((uint16_t)data[0] << 8) | (uint16_t)data[1]);
+}
+
+static void quic_write_u16_be(uint8_t *out, uint16_t value) {
+    out[0] = (uint8_t)(value >> 8);
+    out[1] = (uint8_t)value;
+}
+
+void quic_socket_addr_init_ipv4(quic_socket_addr_t *addr,
+                                uint8_t a,
+                                uint8_t b,
+                                uint8_t c,
+                                uint8_t d,
+                                uint16_t port) {
+    if (!addr) {
+        return;
+    }
+    memset(addr, 0, sizeof(*addr));
+    addr->family = QUIC_ADDR_FAMILY_V4;
+    addr->addr[0] = a;
+    addr->addr[1] = b;
+    addr->addr[2] = c;
+    addr->addr[3] = d;
+    addr->port = port;
+}
+
+int quic_socket_addr_equal(const quic_socket_addr_t *lhs, const quic_socket_addr_t *rhs) {
+    if (!lhs || !rhs) {
+        return 0;
+    }
+    if (lhs->family != rhs->family || lhs->port != rhs->port) {
+        return 0;
+    }
+    if (lhs->family == QUIC_ADDR_FAMILY_V4) {
+        return memcmp(lhs->addr, rhs->addr, 4) == 0;
+    }
+    return lhs->family == QUIC_ADDR_FAMILY_NONE;
+}
+
+void quic_path_addr_init(quic_path_addr_t *path, const quic_socket_addr_t *local, const quic_socket_addr_t *peer) {
+    if (!path) {
+        return;
+    }
+    memset(path, 0, sizeof(*path));
+    if (local) {
+        path->local = *local;
+    }
+    if (peer) {
+        path->peer = *peer;
+    }
+}
+
+static int quic_path_addr_equal(const quic_path_addr_t *lhs, const quic_path_addr_t *rhs) {
+    return lhs && rhs &&
+           quic_socket_addr_equal(&lhs->local, &rhs->local) &&
+           quic_socket_addr_equal(&lhs->peer, &rhs->peer);
+}
+
+static int quic_tls_fill_random_bytes(uint8_t *out, size_t len) {
+    return out && RAND_bytes(out, (int)len) == 1 ? 0 : -1;
+}
+
+static int quic_tls_fill_stateless_reset_token(uint8_t *out) {
+    return quic_tls_fill_random_bytes(out, QUIC_STATELESS_RESET_TOKEN_LEN);
+}
+
+static uint64_t quic_tls_recovery_pto_interval_ms(const quic_tls_conn_t *conn) {
+    uint64_t smoothed_rtt;
+    uint64_t variance;
+    uint64_t pto;
+
+    if (!conn) {
+        return QUIC_RECOVERY_INITIAL_RTT_MS + QUIC_RECOVERY_GRANULARITY_MS;
+    }
+    smoothed_rtt = conn->conn.recovery.smoothed_rtt_ms;
+    variance = conn->conn.recovery.rttvar_ms * 4ULL;
+    if (variance < QUIC_RECOVERY_GRANULARITY_MS) {
+        variance = QUIC_RECOVERY_GRANULARITY_MS;
+    }
+    pto = smoothed_rtt + variance;
+    if (conn->conn.recovery.handshake_confirmed) {
+        pto += conn->conn.recovery.max_ack_delay_ms;
+    }
+    return pto << conn->conn.recovery.pto_count;
+}
+
+static uint64_t quic_tls_compute_effective_idle_timeout_ms(const quic_tls_conn_t *conn) {
+    uint64_t local_timeout = 0;
+    uint64_t peer_timeout = 0;
+    uint64_t effective = 0;
+    uint64_t minimum_timeout;
+
+    if (!conn) {
+        return 0;
+    }
+
+    if (conn->local_transport_params.max_idle_timeout.present) {
+        local_timeout = conn->local_transport_params.max_idle_timeout.value;
+    }
+    if (conn->peer_transport_params.max_idle_timeout.present) {
+        peer_timeout = conn->peer_transport_params.max_idle_timeout.value;
+    }
+
+    if (local_timeout == 0) {
+        effective = peer_timeout;
+    } else if (peer_timeout == 0) {
+        effective = local_timeout;
+    } else {
+        effective = local_timeout < peer_timeout ? local_timeout : peer_timeout;
+    }
+
+    if (effective == 0) {
+        return 0;
+    }
+
+    minimum_timeout = quic_tls_recovery_pto_interval_ms(conn) * 3ULL;
+    return effective < minimum_timeout ? minimum_timeout : effective;
+}
+
+static void quic_tls_restart_idle_timer(quic_tls_conn_t *conn, uint64_t now_ms) {
+    if (!conn) {
+        return;
+    }
+    conn->effective_idle_timeout_ms = quic_tls_compute_effective_idle_timeout_ms(conn);
+    if (conn->effective_idle_timeout_ms == 0) {
+        conn->idle_deadline_ms = 0;
+        quic_conn_disarm_timer(&conn->conn, QUIC_CONN_TIMER_IDLE);
+        return;
+    }
+    conn->idle_deadline_ms = now_ms + conn->effective_idle_timeout_ms;
+    quic_conn_arm_timer(&conn->conn, QUIC_CONN_TIMER_IDLE, conn->idle_deadline_ms);
+}
+
+static void quic_tls_note_ack_eliciting_sent(quic_tls_conn_t *conn, uint64_t now_ms) {
+    if (!conn) {
+        return;
+    }
+    if (!conn->ack_eliciting_sent_since_rx) {
+        conn->ack_eliciting_sent_since_rx = 1;
+        quic_tls_restart_idle_timer(conn, now_ms);
+    }
+}
+
+static int quic_tls_has_sendable_path_control(const quic_tls_conn_t *conn) {
+    const quic_tls_path_t *path;
+
+    if (!conn || !conn->path_control_pending || conn->pending_path_index >= conn->path_count) {
+        return 0;
+    }
+    path = &conn->paths[conn->pending_path_index];
+    return path->challenge_pending || path->response_pending;
+}
+
+static size_t quic_tls_find_path_index(const quic_tls_conn_t *conn, const quic_path_addr_t *path) {
+    size_t i;
+
+    if (!conn || !path) {
+        return SIZE_MAX;
+    }
+    for (i = 0; i < conn->path_count; i++) {
+        if (conn->paths[i].active && quic_path_addr_equal(&conn->paths[i].addr, path)) {
+            return i;
+        }
+    }
+    return SIZE_MAX;
+}
+
+static quic_tls_path_t *quic_tls_find_path(quic_tls_conn_t *conn, const quic_path_addr_t *path, size_t *index_out) {
+    size_t index = quic_tls_find_path_index(conn, path);
+
+    if (index == SIZE_MAX) {
+        return NULL;
+    }
+    if (index_out) {
+        *index_out = index;
+    }
+    return &conn->paths[index];
+}
+
+static quic_tls_path_t *quic_tls_add_path(quic_tls_conn_t *conn, const quic_path_addr_t *path, quic_tls_path_state_t state, size_t *index_out) {
+    quic_tls_path_t *entry;
+
+    if (!conn || !path || conn->path_count >= QUIC_TLS_MAX_PATHS) {
+        return NULL;
+    }
+
+    entry = &conn->paths[conn->path_count];
+    memset(entry, 0, sizeof(*entry));
+    entry->active = 1;
+    entry->addr = *path;
+    entry->state = state;
+    entry->mtu_validated = state == QUIC_TLS_PATH_VALIDATED ? 1 : 0;
+    if (index_out) {
+        *index_out = conn->path_count;
+    }
+    conn->path_count++;
+    return entry;
+}
+
+static quic_tls_path_t *quic_tls_ensure_path(quic_tls_conn_t *conn, const quic_path_addr_t *path, quic_tls_path_state_t state, size_t *index_out) {
+    quic_tls_path_t *found = quic_tls_find_path(conn, path, index_out);
+
+    if (found) {
+        if (found->state == QUIC_TLS_PATH_UNUSED || state == QUIC_TLS_PATH_VALIDATED) {
+            found->state = state;
+        }
+        return found;
+    }
+    return quic_tls_add_path(conn, path, state, index_out);
+}
+
+static quic_tls_cid_state_t *quic_tls_find_local_cid_by_seq(quic_tls_conn_t *conn, uint64_t sequence, size_t *index_out) {
+    size_t i;
+
+    if (!conn) {
+        return NULL;
+    }
+    for (i = 0; i < conn->local_cid_count; i++) {
+        if (conn->local_cids[i].active && conn->local_cids[i].sequence == sequence) {
+            if (index_out) {
+                *index_out = i;
+            }
+            return &conn->local_cids[i];
+        }
+    }
+    return NULL;
+}
+
+static quic_tls_cid_state_t *quic_tls_find_peer_cid_by_seq(quic_tls_conn_t *conn, uint64_t sequence, size_t *index_out) {
+    size_t i;
+
+    if (!conn) {
+        return NULL;
+    }
+    for (i = 0; i < conn->peer_cid_count; i++) {
+        if (conn->peer_cids[i].active && conn->peer_cids[i].sequence == sequence) {
+            if (index_out) {
+                *index_out = i;
+            }
+            return &conn->peer_cids[i];
+        }
+    }
+    return NULL;
+}
+
+static int quic_tls_register_local_cid(quic_tls_conn_t *conn,
+                                       const quic_cid_t *cid,
+                                       uint64_t sequence,
+                                       const uint8_t *token,
+                                       int issued) {
+    quic_tls_cid_state_t *entry;
+
+    if (!conn || !cid || cid->len == 0 || conn->local_cid_count >= QUIC_TLS_MAX_CID_POOL) {
+        return -1;
+    }
+    entry = &conn->local_cids[conn->local_cid_count++];
+    memset(entry, 0, sizeof(*entry));
+    entry->active = 1;
+    entry->issued = issued ? 1 : 0;
+    entry->sequence = sequence;
+    entry->cid = *cid;
+    if (token) {
+        memcpy(entry->stateless_reset_token, token, QUIC_STATELESS_RESET_TOKEN_LEN);
+    } else if (quic_tls_fill_stateless_reset_token(entry->stateless_reset_token) != 0) {
+        return -1;
+    }
+    return 0;
+}
+
+static int quic_tls_register_peer_cid(quic_tls_conn_t *conn,
+                                      const quic_cid_t *cid,
+                                      uint64_t sequence,
+                                      const uint8_t *token) {
+    quic_tls_cid_state_t *existing;
+    quic_tls_cid_state_t *entry;
+
+    if (!conn || !cid || cid->len == 0) {
+        return -1;
+    }
+    existing = quic_tls_find_peer_cid_by_seq(conn, sequence, NULL);
+    if (existing) {
+        if (existing->cid.len != cid->len || memcmp(existing->cid.data, cid->data, cid->len) != 0) {
+            return -1;
+        }
+        if (token) {
+            memcpy(existing->stateless_reset_token, token, QUIC_STATELESS_RESET_TOKEN_LEN);
+        }
+        return 0;
+    }
+    if (conn->peer_cid_count >= QUIC_TLS_MAX_CID_POOL) {
+        return -1;
+    }
+    entry = &conn->peer_cids[conn->peer_cid_count++];
+    memset(entry, 0, sizeof(*entry));
+    entry->active = 1;
+    entry->issued = 1;
+    entry->sequence = sequence;
+    entry->cid = *cid;
+    if (token) {
+        memcpy(entry->stateless_reset_token, token, QUIC_STATELESS_RESET_TOKEN_LEN);
+    }
+    return 0;
+}
+
+static int quic_tls_generate_next_local_cid(quic_tls_conn_t *conn,
+                                            quic_cid_t *cid,
+                                            uint8_t token[QUIC_STATELESS_RESET_TOKEN_LEN]) {
+    size_t i;
+
+    if (!conn || !cid) {
+        return -1;
+    }
+    memset(cid, 0, sizeof(*cid));
+    cid->len = conn->local_cid.len ? conn->local_cid.len : 8;
+    if (quic_tls_fill_random_bytes(cid->data, cid->len) != 0) {
+        return -1;
+    }
+    for (i = 0; i < cid->len; i++) {
+        cid->data[i] ^= (uint8_t)(conn->next_local_cid_sequence + i + 0x5a);
+    }
+    if (quic_tls_fill_stateless_reset_token(token) != 0) {
+        return -1;
+    }
+    return 0;
+}
+
+static int quic_tls_encode_preferred_address_ipv4(const quic_socket_addr_t *peer_addr,
+                                                  const quic_cid_t *cid,
+                                                  const uint8_t *token,
+                                                  uint8_t *out,
+                                                  size_t out_len,
+                                                  size_t *written) {
+    size_t offset = 0;
+
+    if (!peer_addr || !cid || !token || !out || !written ||
+        peer_addr->family != QUIC_ADDR_FAMILY_V4 ||
+        cid->len == 0 ||
+        out_len < (size_t)(4 + 2 + 16 + 2 + 1 + cid->len + QUIC_STATELESS_RESET_TOKEN_LEN)) {
+        return -1;
+    }
+
+    memcpy(out + offset, peer_addr->addr, 4);
+    offset += 4;
+    quic_write_u16_be(out + offset, peer_addr->port);
+    offset += 2;
+    memset(out + offset, 0, 16 + 2);
+    offset += 18;
+    out[offset++] = cid->len;
+    memcpy(out + offset, cid->data, cid->len);
+    offset += cid->len;
+    memcpy(out + offset, token, QUIC_STATELESS_RESET_TOKEN_LEN);
+    offset += QUIC_STATELESS_RESET_TOKEN_LEN;
+    *written = offset;
+    return 0;
+}
+
+static int quic_tls_decode_preferred_address_ipv4(const quic_preferred_address_param_t *param,
+                                                  quic_tls_preferred_address_t *out) {
+    size_t offset = 0;
+    uint8_t cid_len;
+
+    if (!param || !out || !param->present || param->len < (size_t)(4 + 2 + 16 + 2 + 1 + QUIC_STATELESS_RESET_TOKEN_LEN)) {
+        return -1;
+    }
+    memset(out, 0, sizeof(*out));
+    out->present = 1;
+    quic_socket_addr_init_ipv4(&out->peer_addr,
+                               param->bytes[0],
+                               param->bytes[1],
+                               param->bytes[2],
+                               param->bytes[3],
+                               quic_read_u16_be(param->bytes + 4));
+    offset = 4 + 2 + 16 + 2;
+    cid_len = param->bytes[offset++];
+    if (cid_len == 0 || cid_len > MAX_CID_LEN || offset + cid_len + QUIC_STATELESS_RESET_TOKEN_LEN > param->len) {
+        return -1;
+    }
+    out->cid.len = cid_len;
+    memcpy(out->cid.data, param->bytes + offset, cid_len);
+    offset += cid_len;
+    memcpy(out->stateless_reset_token, param->bytes + offset, QUIC_STATELESS_RESET_TOKEN_LEN);
+    return 0;
+}
+
+static int quic_tls_detect_stateless_reset(const quic_tls_conn_t *conn, const uint8_t *packet, size_t packet_len) {
+    size_t i;
+
+    if (!conn || !packet || packet_len < QUIC_TLS_STATELESS_RESET_MIN_LEN) {
+        return 0;
+    }
+
+    for (i = 0; i < conn->peer_cid_count; i++) {
+        const quic_tls_cid_state_t *cid = &conn->peer_cids[i];
+
+        if (!cid->active || cid->retired) {
+            continue;
+        }
+        if (memcmp(packet + packet_len - QUIC_STATELESS_RESET_TOKEN_LEN,
+                   cid->stateless_reset_token,
+                   QUIC_STATELESS_RESET_TOKEN_LEN) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void quic_tls_mark_path_validated(quic_tls_conn_t *conn, size_t path_index) {
+    quic_tls_path_t *path;
+
+    if (!conn || path_index >= conn->path_count) {
+        return;
+    }
+    path = &conn->paths[path_index];
+    path->state = QUIC_TLS_PATH_VALIDATED;
+    path->challenge_pending = 0;
+    path->challenge_in_flight = 0;
+    path->challenge_expected = 0;
+    path->response_pending = 0;
+    path->response_in_flight = 0;
+    path->validation_deadline_ms = 0;
+    path->mtu_validated = 1;
+    conn->active_path_index = path_index;
+    conn->tx_path_index = path_index;
+    if (conn->role == QUIC_ROLE_SERVER) {
+        conn->peer_address_validated = 1;
+        conn->amplification_blocked = 0;
+    }
+}
+
+static int quic_tls_prepare_path_challenge(quic_tls_conn_t *conn, size_t path_index, int mtu_probe_required) {
+    quic_tls_path_t *path;
+    uint8_t token_bytes[8];
+    uint64_t token = 0;
+
+    if (!conn || path_index >= conn->path_count) {
+        return -1;
+    }
+    path = &conn->paths[path_index];
+    if (!path->active || path->state == QUIC_TLS_PATH_VALIDATED) {
+        return 0;
+    }
+    if (quic_tls_fill_random_bytes(token_bytes, sizeof(token_bytes)) != 0) {
+        return -1;
+    }
+    memcpy(&token, token_bytes, sizeof(token));
+    path->local_challenge_token = token;
+    path->challenge_pending = 1;
+    path->challenge_in_flight = 0;
+    path->challenge_expected = 1;
+    path->mtu_probe_required = mtu_probe_required ? 1 : 0;
+    path->state = QUIC_TLS_PATH_VALIDATING;
+    path->validation_deadline_ms = quic_tls_now_ms() + (quic_tls_recovery_pto_interval_ms(conn) * 3ULL);
+    conn->pending_path_index = path_index;
+    conn->path_control_pending = 1;
+    return 0;
+}
+
+static void quic_tls_maybe_issue_post_handshake_control(quic_tls_conn_t *conn) {
+    quic_cid_t cid;
+    uint8_t token[QUIC_STATELESS_RESET_TOKEN_LEN];
+    size_t path_index;
+
+    if (!conn || !conn->handshake_complete || !conn->peer_transport_params_ready) {
+        return;
+    }
+
+    if (conn->role == QUIC_ROLE_SERVER &&
+        conn->new_token_to_send_len == 0 &&
+        quic_tls_build_new_token(conn,
+                                 conn->new_token_to_send,
+                                 sizeof(conn->new_token_to_send),
+                                 &conn->new_token_to_send_len) == 0) {
+        conn->new_token_pending = 1;
+    }
+
+    if (!conn->local_preferred_address.present &&
+        conn->peer_active_connection_id_limit > 1 &&
+        conn->local_cid_count < 2 &&
+        !conn->new_connection_id_pending &&
+        quic_tls_generate_next_local_cid(conn, &cid, token) == 0 &&
+        quic_tls_register_local_cid(conn, &cid, conn->next_local_cid_sequence, token, 1) == 0) {
+        conn->pending_issue_cid_index = conn->local_cid_count - 1;
+        conn->next_local_cid_sequence++;
+        conn->new_connection_id_pending = 1;
+    }
+
+    (void)path_index;
+}
 
 static uint64_t quic_tls_now_ms(void) {
     struct timespec ts;
@@ -408,9 +906,14 @@ static void quic_tls_apply_packet_side_effects(quic_tls_conn_t *conn,
                                                const quic_sent_packet_t *packet,
                                                int schedule_retransmit) {
     enum ssl_encryption_level_t level;
+    quic_tls_path_t *path = NULL;
 
     if (!conn || !packet) {
         return;
+    }
+
+    if (packet->meta.path_id < conn->path_count) {
+        path = &conn->paths[packet->meta.path_id];
     }
 
     if (packet->meta.includes_ping) {
@@ -442,6 +945,36 @@ static void quic_tls_apply_packet_side_effects(quic_tls_conn_t *conn,
         if (schedule_retransmit) {
             conn->streams.max_streams_uni_pending = 1;
         }
+    }
+    if (packet->meta.includes_new_connection_id) {
+        conn->new_connection_id_in_flight = 0;
+        if (schedule_retransmit) {
+            conn->new_connection_id_pending = 1;
+        } else if (conn->pending_issue_cid_index < conn->local_cid_count) {
+            conn->local_cids[conn->pending_issue_cid_index].acked = 1;
+        }
+    }
+    if (packet->meta.includes_retire_connection_id) {
+        conn->retire_connection_id_in_flight = 0;
+        if (schedule_retransmit) {
+            conn->retire_connection_id_pending = 1;
+        }
+    }
+    if (packet->meta.includes_new_token) {
+        conn->new_token_in_flight = 0;
+        if (schedule_retransmit) {
+            conn->new_token_pending = 1;
+        }
+    }
+    if (packet->meta.includes_path_challenge && path) {
+        path->challenge_in_flight = 0;
+        if (schedule_retransmit) {
+            path->challenge_pending = 1;
+            conn->path_control_pending = 1;
+        }
+    }
+    if (packet->meta.includes_path_response && path) {
+        path->response_in_flight = 0;
     }
     quic_tls_clear_stream_inflight(conn, packet, schedule_retransmit);
 
@@ -542,30 +1075,54 @@ static enum ssl_encryption_level_t quic_tls_ack_level_for_rx(enum ssl_encryption
     return level == ssl_encryption_early_data ? ssl_encryption_application : level;
 }
 
-static int quic_tls_server_amplification_limited(const quic_tls_conn_t *conn, size_t packet_len) {
+static int quic_tls_server_amplification_limited_on_path(const quic_tls_conn_t *conn,
+                                                         const quic_tls_path_t *path,
+                                                         size_t packet_len) {
     uint64_t budget;
 
-    if (!conn || conn->role != QUIC_ROLE_SERVER || conn->peer_address_validated) {
+    if (!conn || conn->role != QUIC_ROLE_SERVER) {
+        return 0;
+    }
+    if (!path) {
+        if (conn->peer_address_validated) {
+            return 0;
+        }
+        budget = conn->bytes_received * 3ULL;
+        return conn->bytes_sent + packet_len > budget;
+    }
+    if (path->state == QUIC_TLS_PATH_VALIDATED) {
         return 0;
     }
 
-    budget = conn->bytes_received * 3;
-    return conn->bytes_sent + packet_len > budget;
+    budget = path->bytes_received * 3ULL;
+    return path->bytes_sent_before_validation + packet_len > budget;
 }
 
 static void quic_tls_note_packet_sent(quic_tls_conn_t *conn, size_t packet_len) {
+    quic_tls_path_t *path = NULL;
+
     if (!conn) {
         return;
     }
+    if (conn->tx_path_index < conn->path_count) {
+        path = &conn->paths[conn->tx_path_index];
+    }
     conn->amplification_blocked = 0;
     conn->bytes_sent += packet_len;
+    if (path && path->state != QUIC_TLS_PATH_VALIDATED) {
+        path->bytes_sent_before_validation += packet_len;
+    }
 }
 
-static void quic_tls_note_packet_received(quic_tls_conn_t *conn, size_t packet_len) {
+static void quic_tls_note_packet_received(quic_tls_conn_t *conn, quic_tls_path_t *path, size_t packet_len) {
     if (!conn) {
         return;
     }
     conn->bytes_received += packet_len;
+    if (path) {
+        path->bytes_received += packet_len;
+        path->received_on_path = 1;
+    }
     if (conn->amplification_blocked) {
         conn->amplification_blocked = 0;
         quic_tls_arm_loss_timer(conn);
@@ -591,7 +1148,11 @@ static int quic_tls_level_has_sendable_output(const quic_tls_conn_t *conn, enum 
         return 0;
     }
     if (level == ssl_encryption_application) {
-        has_stream_output = quic_stream_map_has_pending_output(&conn->streams);
+        has_stream_output = quic_stream_map_has_pending_output(&conn->streams) ||
+                            conn->new_connection_id_pending ||
+                            conn->retire_connection_id_pending ||
+                            quic_tls_has_sendable_path_control(conn) ||
+                            conn->new_token_pending;
     }
     return (quic_crypto_sendbuf_has_pending(&conn->levels[level].send) ||
             conn->levels[level].ack_pending ||
@@ -679,7 +1240,45 @@ static int quic_tls_update_peer_transport_params(quic_tls_conn_t *conn) {
                                     quic_tls_transport_param_value(&conn->peer_transport_params.initial_max_stream_data_uni),
                                     quic_tls_transport_param_value(&conn->peer_transport_params.initial_max_streams_bidi),
                                     quic_tls_transport_param_value(&conn->peer_transport_params.initial_max_streams_uni));
+    if (conn->peer_transport_params.initial_source_connection_id.present) {
+        if (quic_tls_register_peer_cid(conn,
+                                       &conn->peer_transport_params.initial_source_connection_id.cid,
+                                       0,
+                                       conn->peer_transport_params.stateless_reset_token.present
+                                           ? conn->peer_transport_params.stateless_reset_token.token
+                                           : NULL) != 0) {
+            return quic_tls_fail(conn, "failed to register peer initial source cid");
+        }
+        conn->peer_cid = conn->peer_transport_params.initial_source_connection_id.cid;
+        conn->peer_cid_known = 1;
+        conn->active_peer_cid_index = 0;
+    }
+    if (conn->peer_transport_params.stateless_reset_token.present &&
+        conn->active_peer_cid_index < conn->peer_cid_count) {
+        memcpy(conn->peer_cids[conn->active_peer_cid_index].stateless_reset_token,
+               conn->peer_transport_params.stateless_reset_token.token,
+               QUIC_STATELESS_RESET_TOKEN_LEN);
+    }
+    conn->peer_disable_active_migration = conn->peer_transport_params.disable_active_migration_present ? 1 : 0;
+    conn->peer_active_connection_id_limit =
+        conn->peer_transport_params.active_connection_id_limit.present
+            ? conn->peer_transport_params.active_connection_id_limit.value
+            : 2;
+    if (conn->peer_transport_params.preferred_address.present) {
+        if (quic_tls_decode_preferred_address_ipv4(&conn->peer_transport_params.preferred_address,
+                                                  &conn->peer_preferred_address) != 0) {
+            return quic_tls_fail(conn, "failed to decode peer preferred address");
+        }
+        if (quic_tls_register_peer_cid(conn,
+                                       &conn->peer_preferred_address.cid,
+                                       1,
+                                       conn->peer_preferred_address.stateless_reset_token) != 0) {
+            return quic_tls_fail(conn, "failed to register preferred address cid");
+        }
+    }
     conn->peer_transport_params_ready = 1;
+    quic_tls_restart_idle_timer(conn, quic_tls_now_ms());
+    quic_tls_maybe_issue_post_handshake_control(conn);
     quic_tls_sync_recovery_state(conn);
     return 0;
 }
@@ -701,14 +1300,48 @@ static int quic_tls_build_retry_token(const quic_cid_t *original_dcid,
     return 0;
 }
 
+static int quic_tls_build_new_token(const quic_tls_conn_t *conn,
+                                    uint8_t *out,
+                                    size_t out_len,
+                                    size_t *written) {
+    if (!conn || !conn->original_dcid_known || !out || !written ||
+        conn->original_dcid.len == 0 ||
+        out_len < (size_t)(8 + conn->original_dcid.len)) {
+        return -1;
+    }
+
+    out[0] = 'N';
+    out[1] = 'T';
+    out[2] = 'Q';
+    out[3] = conn->original_dcid.len;
+    out[4] = (uint8_t)(conn->version >> 24);
+    out[5] = (uint8_t)(conn->version >> 16);
+    out[6] = (uint8_t)(conn->version >> 8);
+    out[7] = (uint8_t)conn->version;
+    memcpy(out + 8, conn->original_dcid.data, conn->original_dcid.len);
+    *written = 8 + conn->original_dcid.len;
+    return 0;
+}
+
 static int quic_tls_validate_retry_token(const uint8_t *token,
                                          size_t token_len,
-                                         const quic_cid_t *original_dcid) {
+                                         const quic_cid_t *original_dcid,
+                                         uint32_t version) {
     if (!token || !original_dcid || token_len < 4) {
         return 0;
     }
     if (token[0] != 'A' || token[1] != 'I' || token[2] != 'Q' || token[3] != original_dcid->len) {
-        return 0;
+        if (token_len < 8 ||
+            token[0] != 'N' || token[1] != 'T' || token[2] != 'Q' ||
+            token[3] != original_dcid->len ||
+            (((uint32_t)token[4] << 24) |
+             ((uint32_t)token[5] << 16) |
+             ((uint32_t)token[6] << 8) |
+             (uint32_t)token[7]) != version) {
+            return 0;
+        }
+        return token_len == (size_t)(8 + original_dcid->len) &&
+               memcmp(token + 8, original_dcid->data, original_dcid->len) == 0;
     }
     return token_len == (size_t)(4 + original_dcid->len) &&
            memcmp(token + 4, original_dcid->data, original_dcid->len) == 0;
@@ -763,6 +1396,8 @@ static void quic_tls_maybe_discard_keys(quic_tls_conn_t *conn) {
 
 static int quic_tls_set_transport_params(quic_tls_conn_t *conn) {
     int encoded_len;
+    uint8_t preferred_addr[QUIC_MAX_PREFERRED_ADDRESS_LEN];
+    size_t preferred_addr_len = 0;
 
     if (!conn || !conn->ssl || !conn->local_cid.len) {
         return quic_tls_fail(conn, "transport params missing local cid");
@@ -772,7 +1407,7 @@ static int quic_tls_set_transport_params(quic_tls_conn_t *conn) {
     conn->local_transport_params.max_udp_payload_size.present = 1;
     conn->local_transport_params.max_udp_payload_size.value = 1200;
     conn->local_transport_params.max_idle_timeout.present = 1;
-    conn->local_transport_params.max_idle_timeout.value = 30000;
+    conn->local_transport_params.max_idle_timeout.value = conn->configured_max_idle_timeout_ms;
     conn->local_transport_params.initial_max_data.present = 1;
     conn->local_transport_params.initial_max_data.value = conn->initial_max_data;
     conn->local_transport_params.initial_max_stream_data_bidi_local.present = 1;
@@ -786,15 +1421,32 @@ static int quic_tls_set_transport_params(quic_tls_conn_t *conn) {
     conn->local_transport_params.initial_max_streams_uni.present = 1;
     conn->local_transport_params.initial_max_streams_uni.value = conn->initial_max_streams_uni;
     conn->local_transport_params.active_connection_id_limit.present = 1;
-    conn->local_transport_params.active_connection_id_limit.value = 4;
+    conn->local_transport_params.active_connection_id_limit.value = conn->local_active_connection_id_limit;
     conn->local_transport_params.initial_source_connection_id.present = 1;
     conn->local_transport_params.initial_source_connection_id.cid = conn->local_cid;
+    conn->local_transport_params.stateless_reset_token.present = 1;
+    memcpy(conn->local_transport_params.stateless_reset_token.token,
+           conn->local_cids[conn->active_local_cid_index].stateless_reset_token,
+           QUIC_STATELESS_RESET_TOKEN_LEN);
     if (conn->role == QUIC_ROLE_SERVER) {
         if (!conn->original_dcid_known) {
             return quic_tls_fail(conn, "server original dcid unavailable");
         }
         conn->local_transport_params.original_destination_connection_id.present = 1;
         conn->local_transport_params.original_destination_connection_id.cid = conn->original_dcid;
+        if (conn->local_preferred_address.present) {
+            if (quic_tls_encode_preferred_address_ipv4(&conn->local_preferred_address.peer_addr,
+                                                      &conn->local_preferred_address.cid,
+                                                      conn->local_preferred_address.stateless_reset_token,
+                                                      preferred_addr,
+                                                      sizeof(preferred_addr),
+                                                      &preferred_addr_len) != 0) {
+                return quic_tls_fail(conn, "failed to encode preferred address");
+            }
+            conn->local_transport_params.preferred_address.present = 1;
+            conn->local_transport_params.preferred_address.len = preferred_addr_len;
+            memcpy(conn->local_transport_params.preferred_address.bytes, preferred_addr, preferred_addr_len);
+        }
     }
 
     encoded_len = quic_transport_params_encode(&conn->local_transport_params,
@@ -1235,6 +1887,95 @@ static int quic_tls_parse_frames(quic_tls_conn_t *conn,
                 break;
             }
 
+            case QUIC_FRAME_NEW_CONNECTION_ID: {
+                uint64_t sequence;
+                uint64_t retire_prior_to;
+                uint8_t cid_len;
+                quic_cid_t cid;
+                uint8_t token[QUIC_STATELESS_RESET_TOKEN_LEN];
+                size_t i;
+                size_t active_peer_cids = 0;
+
+                if (level != ssl_encryption_application && level != ssl_encryption_early_data) {
+                    return quic_tls_fail(conn, "new_connection_id received before application keys");
+                }
+                if (quic_decode_varint(plaintext, plaintext_len, &offset, &sequence) != 0 ||
+                    quic_decode_varint(plaintext, plaintext_len, &offset, &retire_prior_to) != 0 ||
+                    offset >= plaintext_len) {
+                    return quic_tls_fail(conn, "invalid new_connection_id frame");
+                }
+                cid_len = plaintext[offset++];
+                if (cid_len == 0 || cid_len > MAX_CID_LEN ||
+                    offset + cid_len + QUIC_STATELESS_RESET_TOKEN_LEN > plaintext_len ||
+                    retire_prior_to > sequence) {
+                    return quic_tls_fail(conn, "invalid new_connection_id payload");
+                }
+                memset(&cid, 0, sizeof(cid));
+                cid.len = cid_len;
+                memcpy(cid.data, plaintext + offset, cid_len);
+                offset += cid_len;
+                memcpy(token, plaintext + offset, QUIC_STATELESS_RESET_TOKEN_LEN);
+                offset += QUIC_STATELESS_RESET_TOKEN_LEN;
+                if (quic_tls_register_peer_cid(conn, &cid, sequence, token) != 0) {
+                    return quic_tls_fail(conn, "failed to register peer connection id");
+                }
+                for (i = 0; i < conn->peer_cid_count; i++) {
+                    if (conn->peer_cids[i].active && conn->peer_cids[i].sequence < retire_prior_to) {
+                        conn->peer_cids[i].retired = 1;
+                        conn->pending_retire_sequence = conn->peer_cids[i].sequence;
+                        conn->retire_connection_id_pending = 1;
+                    }
+                    if (conn->peer_cids[i].active && !conn->peer_cids[i].retired) {
+                        active_peer_cids++;
+                    }
+                }
+                if (conn->active_peer_cid_index < conn->peer_cid_count &&
+                    conn->peer_cids[conn->active_peer_cid_index].retired) {
+                    for (i = 0; i < conn->peer_cid_count; i++) {
+                        if (conn->peer_cids[i].active && !conn->peer_cids[i].retired) {
+                            conn->active_peer_cid_index = i;
+                            conn->peer_cid = conn->peer_cids[i].cid;
+                            conn->peer_cid_known = 1;
+                            break;
+                        }
+                    }
+                }
+                if (active_peer_cids > conn->local_active_connection_id_limit) {
+                    return quic_tls_fail(conn, "peer exceeded active_connection_id_limit");
+                }
+                *saw_ack_eliciting = 1;
+                break;
+            }
+
+            case QUIC_FRAME_RETIRE_CONNECTION_ID: {
+                uint64_t sequence;
+                quic_tls_cid_state_t *local_cid;
+                quic_cid_t cid;
+                uint8_t token[QUIC_STATELESS_RESET_TOKEN_LEN];
+
+                if (level != ssl_encryption_application && level != ssl_encryption_early_data) {
+                    return quic_tls_fail(conn, "retire_connection_id received before application keys");
+                }
+                if (quic_decode_varint(plaintext, plaintext_len, &offset, &sequence) != 0) {
+                    return quic_tls_fail(conn, "invalid retire_connection_id frame");
+                }
+                local_cid = quic_tls_find_local_cid_by_seq(conn, sequence, NULL);
+                if (!local_cid) {
+                    return quic_tls_fail(conn, "retire_connection_id referenced unknown sequence");
+                }
+                local_cid->retired = 1;
+                *saw_ack_eliciting = 1;
+                if (conn->local_cid_count < conn->peer_active_connection_id_limit &&
+                    !conn->new_connection_id_pending &&
+                    quic_tls_generate_next_local_cid(conn, &cid, token) == 0 &&
+                    quic_tls_register_local_cid(conn, &cid, conn->next_local_cid_sequence, token, 1) == 0) {
+                    conn->pending_issue_cid_index = conn->local_cid_count - 1;
+                    conn->next_local_cid_sequence++;
+                    conn->new_connection_id_pending = 1;
+                }
+                break;
+            }
+
             case QUIC_FRAME_RESET_STREAM: {
                 uint64_t stream_id;
                 uint64_t error_code;
@@ -1390,6 +2131,54 @@ static int quic_tls_parse_frames(quic_tls_conn_t *conn,
                 offset += (size_t)reason_len;
                 *received_connection_close = 1;
                 return quic_tls_on_peer_connection_close(conn);
+            }
+
+            case QUIC_FRAME_PATH_CHALLENGE: {
+                uint64_t token;
+                quic_tls_path_t *path = NULL;
+
+                if (level != ssl_encryption_application && level != ssl_encryption_early_data) {
+                    return quic_tls_fail(conn, "path_challenge received before application keys");
+                }
+                if (offset + 8 > plaintext_len) {
+                    return quic_tls_fail(conn, "invalid path_challenge frame");
+                }
+                memcpy(&token, plaintext + offset, 8);
+                offset += 8;
+                if (conn->rx_path_index < conn->path_count) {
+                    path = &conn->paths[conn->rx_path_index];
+                }
+                if (path) {
+                    path->peer_challenge_token = token;
+                    path->response_pending = 1;
+                    conn->pending_path_index = conn->rx_path_index;
+                    conn->path_control_pending = 1;
+                }
+                *saw_ack_eliciting = 1;
+                break;
+            }
+
+            case QUIC_FRAME_PATH_RESPONSE: {
+                uint64_t token;
+                quic_tls_path_t *path = NULL;
+
+                if (level != ssl_encryption_application && level != ssl_encryption_early_data) {
+                    return quic_tls_fail(conn, "path_response received before application keys");
+                }
+                if (offset + 8 > plaintext_len) {
+                    return quic_tls_fail(conn, "invalid path_response frame");
+                }
+                memcpy(&token, plaintext + offset, 8);
+                offset += 8;
+                if (conn->rx_path_index < conn->path_count) {
+                    path = &conn->paths[conn->rx_path_index];
+                }
+                if (path && path->challenge_expected &&
+                    path->local_challenge_token == token) {
+                    quic_tls_mark_path_validated(conn, conn->rx_path_index);
+                }
+                *saw_ack_eliciting = 1;
+                break;
             }
 
             default:
@@ -2020,6 +2809,121 @@ static int quic_tls_append_stream_control_frames(quic_tls_conn_t *conn,
     return 0;
 }
 
+static int quic_tls_append_connection_control_frames(quic_tls_conn_t *conn,
+                                                     uint8_t *plaintext,
+                                                     size_t plaintext_cap,
+                                                     size_t *plaintext_len,
+                                                     int *ack_eliciting,
+                                                     quic_sent_packet_meta_t *packet_meta) {
+    quic_tls_path_t *path = NULL;
+
+    if (!conn || !plaintext || !plaintext_len || !ack_eliciting || !packet_meta) {
+        return quic_tls_fail(conn, "invalid connection control frame arguments");
+    }
+
+    if (conn->new_connection_id_pending && conn->pending_issue_cid_index < conn->local_cid_count) {
+        const quic_tls_cid_state_t *cid = &conn->local_cids[conn->pending_issue_cid_index];
+        size_t needed = 1 + quic_tls_varint_len(cid->sequence) + quic_tls_varint_len(0) +
+                        1 + cid->cid.len + QUIC_STATELESS_RESET_TOKEN_LEN;
+
+        if (*plaintext_len + needed > plaintext_cap) {
+            return quic_tls_fail(conn, "new_connection_id does not fit");
+        }
+        plaintext[(*plaintext_len)++] = QUIC_FRAME_NEW_CONNECTION_ID;
+        if (quic_tls_append_varint(cid->sequence, plaintext, plaintext_cap, plaintext_len) != 0 ||
+            quic_tls_append_varint(0, plaintext, plaintext_cap, plaintext_len) != 0) {
+            return quic_tls_fail(conn, "failed to encode new_connection_id header");
+        }
+        plaintext[(*plaintext_len)++] = cid->cid.len;
+        memcpy(plaintext + *plaintext_len, cid->cid.data, cid->cid.len);
+        *plaintext_len += cid->cid.len;
+        memcpy(plaintext + *plaintext_len, cid->stateless_reset_token, QUIC_STATELESS_RESET_TOKEN_LEN);
+        *plaintext_len += QUIC_STATELESS_RESET_TOKEN_LEN;
+        conn->new_connection_id_pending = 0;
+        conn->new_connection_id_in_flight = 1;
+        packet_meta->includes_new_connection_id = 1;
+        packet_meta->cid_sequence = cid->sequence;
+        *ack_eliciting = 1;
+        return 0;
+    }
+
+    if (conn->retire_connection_id_pending) {
+        size_t needed = 1 + quic_tls_varint_len(conn->pending_retire_sequence);
+
+        if (*plaintext_len + needed > plaintext_cap) {
+            return quic_tls_fail(conn, "retire_connection_id does not fit");
+        }
+        plaintext[(*plaintext_len)++] = QUIC_FRAME_RETIRE_CONNECTION_ID;
+        if (quic_tls_append_varint(conn->pending_retire_sequence, plaintext, plaintext_cap, plaintext_len) != 0) {
+            return quic_tls_fail(conn, "failed to encode retire_connection_id");
+        }
+        conn->retire_connection_id_pending = 0;
+        conn->retire_connection_id_in_flight = 1;
+        packet_meta->includes_retire_connection_id = 1;
+        packet_meta->retire_sequence = conn->pending_retire_sequence;
+        *ack_eliciting = 1;
+        return 0;
+    }
+
+    if (conn->new_token_pending && conn->new_token_to_send_len > 0) {
+        size_t needed = 1 + quic_tls_varint_len(conn->new_token_to_send_len) + conn->new_token_to_send_len;
+
+        if (*plaintext_len + needed > plaintext_cap) {
+            return quic_tls_fail(conn, "new_token does not fit");
+        }
+        plaintext[(*plaintext_len)++] = QUIC_FRAME_NEW_TOKEN;
+        if (quic_tls_append_varint(conn->new_token_to_send_len, plaintext, plaintext_cap, plaintext_len) != 0) {
+            return quic_tls_fail(conn, "failed to encode new_token length");
+        }
+        memcpy(plaintext + *plaintext_len, conn->new_token_to_send, conn->new_token_to_send_len);
+        *plaintext_len += conn->new_token_to_send_len;
+        conn->new_token_pending = 0;
+        conn->new_token_in_flight = 1;
+        packet_meta->includes_new_token = 1;
+        *ack_eliciting = 1;
+        return 0;
+    }
+
+    if (!conn->path_control_pending || conn->pending_path_index >= conn->path_count) {
+        return 0;
+    }
+
+    path = &conn->paths[conn->pending_path_index];
+    packet_meta->path_id = (uint8_t)conn->pending_path_index;
+
+    if (path->response_pending) {
+        if (*plaintext_len + 1 + 8 > plaintext_cap) {
+            return quic_tls_fail(conn, "path_response does not fit");
+        }
+        plaintext[(*plaintext_len)++] = QUIC_FRAME_PATH_RESPONSE;
+        memcpy(plaintext + *plaintext_len, &path->peer_challenge_token, 8);
+        *plaintext_len += 8;
+        path->response_pending = 0;
+        path->response_in_flight = 1;
+        packet_meta->includes_path_response = 1;
+        packet_meta->path_challenge_token = path->peer_challenge_token;
+        *ack_eliciting = 1;
+        return 0;
+    }
+
+    if (path->challenge_pending) {
+        if (*plaintext_len + 1 + 8 > plaintext_cap) {
+            return quic_tls_fail(conn, "path_challenge does not fit");
+        }
+        plaintext[(*plaintext_len)++] = QUIC_FRAME_PATH_CHALLENGE;
+        memcpy(plaintext + *plaintext_len, &path->local_challenge_token, 8);
+        *plaintext_len += 8;
+        path->challenge_pending = 0;
+        path->challenge_in_flight = 1;
+        packet_meta->includes_path_challenge = 1;
+        packet_meta->path_challenge_token = path->local_challenge_token;
+        *ack_eliciting = 1;
+        return 0;
+    }
+
+    return 0;
+}
+
 static int quic_tls_append_stream_frame(quic_tls_conn_t *conn,
                                         uint8_t *plaintext,
                                         size_t plaintext_cap,
@@ -2163,6 +3067,14 @@ static int quic_tls_build_payload_for_level(quic_tls_conn_t *conn,
     }
 
     if (level == ssl_encryption_application) {
+        if (quic_tls_append_connection_control_frames(conn,
+                                                      plaintext,
+                                                      plaintext_cap,
+                                                      &offset,
+                                                      ack_eliciting,
+                                                      packet_meta) != 0) {
+            return -1;
+        }
         if (quic_tls_append_stream_control_frames(conn,
                                                   plaintext,
                                                   plaintext_cap,
@@ -2218,11 +3130,22 @@ static int quic_tls_build_datagram_for_level(quic_tls_conn_t *conn,
     quic_sent_packet_meta_t packet_meta;
     quic_tls_app_send_snapshot_t app_snapshot;
     int has_app_snapshot = 0;
+    quic_tls_path_t *tx_path = NULL;
 
     memset(&packet_meta, 0, sizeof(packet_meta));
 
     if (!conn || !out || !written || space == QUIC_PN_SPACE_COUNT) {
         return quic_tls_fail(conn, "invalid datagram build arguments");
+    }
+
+    conn->tx_path_index = conn->active_path_index;
+    if (space == QUIC_PN_SPACE_APPLICATION && quic_tls_has_sendable_path_control(conn)) {
+        conn->tx_path_index = conn->pending_path_index;
+    } else if (space == QUIC_PN_SPACE_APPLICATION && conn->path_control_pending) {
+        conn->path_control_pending = 0;
+    }
+    if (conn->tx_path_index < conn->path_count) {
+        tx_path = &conn->paths[conn->tx_path_index];
     }
 
     if (level == ssl_encryption_application) {
@@ -2259,6 +3182,15 @@ static int quic_tls_build_datagram_for_level(quic_tls_conn_t *conn,
     }
 
     if (level == ssl_encryption_application) {
+        size_t min_path_probe_payload = 1200U - QUIC_AEAD_TAG_LEN - (1U + conn->peer_cid.len + 4U);
+
+        if ((packet_meta.includes_path_challenge || packet_meta.includes_path_response) &&
+            plaintext_len < min_path_probe_payload) {
+            while (plaintext_len < sizeof(plaintext) &&
+                   plaintext_len + QUIC_AEAD_TAG_LEN + (1U + conn->peer_cid.len + 4U) < 1200U) {
+                plaintext[plaintext_len++] = QUIC_FRAME_PADDING;
+            }
+        }
         if (quic_tls_encode_short_header(&conn->peer_cid,
                                          plan.packet_number_len,
                                          plan.packet_number,
@@ -2338,7 +3270,7 @@ static int quic_tls_build_datagram_for_level(quic_tls_conn_t *conn,
         return quic_tls_fail(conn, "failed to protect packet");
     }
 
-    if (quic_tls_server_amplification_limited(conn, packet_len)) {
+    if (quic_tls_server_amplification_limited_on_path(conn, tx_path, packet_len)) {
         if (has_app_snapshot) {
             quic_tls_restore_application_send_state(conn, &app_snapshot);
         }
@@ -2393,6 +3325,9 @@ static int quic_tls_build_datagram_for_level(quic_tls_conn_t *conn,
 
     *written = packet_len;
     quic_tls_note_packet_sent(conn, packet_len);
+    if (ack_eliciting) {
+        quic_tls_note_ack_eliciting_sent(conn, quic_tls_now_ms());
+    }
     quic_tls_arm_loss_timer(conn);
     return 0;
 }
@@ -2408,6 +3343,9 @@ void quic_tls_conn_init(quic_tls_conn_t *conn) {
     quic_conn_init(&conn->conn);
     quic_recovery_init(&conn->conn.recovery, QUIC_TLS_MAX_DATAGRAM_SIZE);
     quic_stream_map_init(&conn->streams, 1);
+    conn->local_active_connection_id_limit = 4;
+    conn->peer_active_connection_id_limit = 2;
+    conn->configured_max_idle_timeout_ms = 30000;
     conn->initial_max_data = 65536;
     conn->initial_max_stream_data_bidi_local = 16384;
     conn->initial_max_stream_data_bidi_remote = 16384;
@@ -2418,6 +3356,8 @@ void quic_tls_conn_init(quic_tls_conn_t *conn) {
         quic_crypto_recvbuf_init(&conn->levels[i].recv);
         quic_crypto_sendbuf_init(&conn->levels[i].send);
     }
+    conn->active_path_index = 0;
+    conn->tx_path_index = 0;
     quic_tls_set_error(conn, "ok");
 }
 
@@ -2464,12 +3404,25 @@ int quic_tls_conn_configure(quic_tls_conn_t *conn,
         return quic_tls_fail(conn, "unsupported quic version");
     }
     conn->local_cid = *local_cid;
+    conn->local_cid_count = 0;
+    conn->peer_cid_count = 0;
+    conn->path_count = 0;
+    conn->active_local_cid_index = 0;
+    conn->active_peer_cid_index = 0;
+    conn->next_local_cid_sequence = 1;
     quic_stream_map_free(&conn->streams);
     quic_stream_map_init(&conn->streams, role == QUIC_ROLE_CLIENT);
+    if (quic_tls_register_local_cid(conn, local_cid, 0, NULL, 1) != 0) {
+        return quic_tls_fail(conn, "failed to register local cid");
+    }
 
     if (peer_cid) {
         conn->peer_cid = *peer_cid;
         conn->peer_cid_known = 1;
+        if (role != QUIC_ROLE_CLIENT &&
+            quic_tls_register_peer_cid(conn, peer_cid, 0, NULL) != 0) {
+            return quic_tls_fail(conn, "failed to register peer cid");
+        }
     }
 
     conn->ssl_ctx = SSL_CTX_new(TLS_method());
@@ -2531,6 +3484,8 @@ int quic_tls_conn_configure(quic_tls_conn_t *conn,
     } else {
         SSL_set_accept_state(conn->ssl);
     }
+
+    quic_tls_restart_idle_timer(conn, quic_tls_now_ms());
 
     return 0;
 }
@@ -2632,6 +3587,10 @@ static int quic_tls_server_prepare_initial_context(quic_tls_conn_t *conn,
 
     conn->peer_cid = header->meta.src_cid;
     conn->peer_cid_known = 1;
+    if (quic_tls_register_peer_cid(conn, &header->meta.src_cid, 0, NULL) != 0) {
+        return quic_tls_fail(conn, "failed to register client source cid");
+    }
+    conn->active_peer_cid_index = 0;
 
     if (!conn->original_dcid_known) {
         conn->original_dcid = header->meta.dest_cid;
@@ -2665,7 +3624,7 @@ static int quic_tls_server_maybe_require_retry(quic_tls_conn_t *conn,
     token = header->token_length > 0 ? packet + header->token_offset : NULL;
     if (header->token_length > 0 &&
         conn->original_dcid_known &&
-        quic_tls_validate_retry_token(token, header->token_length, &conn->original_dcid)) {
+        quic_tls_validate_retry_token(token, header->token_length, &conn->original_dcid, conn->version)) {
         conn->peer_address_validated = 1;
         conn->amplification_blocked = 0;
         return 0;
@@ -2691,6 +3650,13 @@ int quic_tls_conn_start(quic_tls_conn_t *conn) {
 }
 
 int quic_tls_conn_handle_datagram(quic_tls_conn_t *conn, const uint8_t *packet, size_t packet_len) {
+    return quic_tls_conn_handle_datagram_on_path(conn, packet, packet_len, NULL);
+}
+
+int quic_tls_conn_handle_datagram_on_path(quic_tls_conn_t *conn,
+                                          const uint8_t *packet,
+                                          size_t packet_len,
+                                          const quic_path_addr_t *path) {
     quic_pkt_header_meta_t meta;
     quic_tls_packet_header_t header;
     uint8_t packet_copy[QUIC_TLS_MAX_DATAGRAM_SIZE];
@@ -2699,9 +3665,13 @@ int quic_tls_conn_handle_datagram(quic_tls_conn_t *conn, const uint8_t *packet, 
     size_t plaintext_len;
     uint64_t packet_number;
     quic_conn_pn_space_t *space;
+    quic_tls_path_t *rx_path = NULL;
+    size_t rx_path_index = SIZE_MAX;
+    int new_path_observed = 0;
     int fed_crypto = 0;
     int saw_ack_eliciting = 0;
     int received_connection_close = 0;
+    uint64_t now_ms;
 
     if (!conn || !packet || packet_len == 0 || packet_len > sizeof(packet_copy)) {
         return quic_tls_fail(conn, "invalid datagram input");
@@ -2709,10 +3679,49 @@ int quic_tls_conn_handle_datagram(quic_tls_conn_t *conn, const uint8_t *packet, 
     if (conn->conn.state == QUIC_CONN_STATE_CLOSED) {
         return 0;
     }
+    now_ms = quic_tls_now_ms();
+
+    if (path) {
+        if (conn->path_count == 0) {
+            rx_path = quic_tls_add_path(conn,
+                                        path,
+                                        (conn->role == QUIC_ROLE_CLIENT || conn->peer_address_validated)
+                                            ? QUIC_TLS_PATH_VALIDATED
+                                            : QUIC_TLS_PATH_VALIDATING,
+                                        &rx_path_index);
+            if (!rx_path) {
+                return quic_tls_fail(conn, "failed to register initial path");
+            }
+            conn->active_path_index = rx_path_index;
+            conn->tx_path_index = rx_path_index;
+        } else {
+            rx_path = quic_tls_find_path(conn, path, &rx_path_index);
+            if (!rx_path) {
+                rx_path = quic_tls_add_path(conn, path, QUIC_TLS_PATH_VALIDATING, &rx_path_index);
+                if (!rx_path) {
+                    return quic_tls_fail(conn, "failed to register received path");
+                }
+                new_path_observed = 1;
+            }
+        }
+        conn->rx_path_index = rx_path_index;
+    } else {
+        conn->rx_path_index = conn->active_path_index;
+        if (conn->path_count > 0 && conn->active_path_index < conn->path_count) {
+            rx_path = &conn->paths[conn->active_path_index];
+            rx_path_index = conn->active_path_index;
+        }
+    }
+
     if (quic_parse_header_meta(packet, packet_len, &meta) != 0) {
+        if (quic_tls_detect_stateless_reset(conn, packet, packet_len)) {
+            conn->stateless_reset_detected = 1;
+            quic_tls_enter_draining(conn, now_ms + QUIC_TLS_CLOSE_TIMEOUT_MS);
+            return 0;
+        }
         return quic_tls_fail(conn, "failed to parse datagram header");
     }
-    quic_tls_note_packet_received(conn, packet_len);
+    quic_tls_note_packet_received(conn, rx_path, packet_len);
     if (conn->conn.state == QUIC_CONN_STATE_DRAINING) {
         return 0;
     }
@@ -2726,6 +3735,11 @@ int quic_tls_conn_handle_datagram(quic_tls_conn_t *conn, const uint8_t *packet, 
 
     memcpy(packet_copy, packet, packet_len);
     if (quic_tls_classify_packet(conn, packet_copy, packet_len, &header) != 0) {
+        if (quic_tls_detect_stateless_reset(conn, packet, packet_len)) {
+            conn->stateless_reset_detected = 1;
+            quic_tls_enter_draining(conn, now_ms + QUIC_TLS_CLOSE_TIMEOUT_MS);
+            return 0;
+        }
         return -1;
     }
 
@@ -2801,6 +3815,11 @@ int quic_tls_conn_handle_datagram(quic_tls_conn_t *conn, const uint8_t *packet, 
                               plaintext,
                               sizeof(plaintext),
                               &plaintext_len) != 0) {
+        if (quic_tls_detect_stateless_reset(conn, packet, packet_len)) {
+            conn->stateless_reset_detected = 1;
+            quic_tls_enter_draining(conn, now_ms + QUIC_TLS_CLOSE_TIMEOUT_MS);
+            return 0;
+        }
         return quic_tls_fail(conn, "failed to remove packet protection");
     }
 
@@ -2836,15 +3855,21 @@ int quic_tls_conn_handle_datagram(quic_tls_conn_t *conn, const uint8_t *packet, 
 
     if (header.space == QUIC_PN_SPACE_HANDSHAKE) {
         conn->received_handshake_packet = 1;
-        if (conn->role == QUIC_ROLE_SERVER) {
+        if (conn->role == QUIC_ROLE_SERVER && rx_path_index == conn->active_path_index) {
             conn->peer_address_validated = 1;
             conn->amplification_blocked = 0;
+            if (rx_path) {
+                quic_tls_mark_path_validated(conn, rx_path_index);
+            }
         }
     }
     if (header.space == QUIC_PN_SPACE_APPLICATION && header.level == ssl_encryption_application &&
-        conn->role == QUIC_ROLE_SERVER) {
+        conn->role == QUIC_ROLE_SERVER && rx_path_index == conn->active_path_index) {
         conn->peer_address_validated = 1;
         conn->amplification_blocked = 0;
+        if (rx_path) {
+            quic_tls_mark_path_validated(conn, rx_path_index);
+        }
     }
 
     if (fed_crypto) {
@@ -2863,21 +3888,59 @@ int quic_tls_conn_handle_datagram(quic_tls_conn_t *conn, const uint8_t *packet, 
         return -1;
     }
 
+    if ((new_path_observed ||
+         (rx_path && rx_path->state != QUIC_TLS_PATH_VALIDATED && rx_path_index != conn->active_path_index)) &&
+        conn->handshake_complete &&
+        rx_path &&
+        !rx_path->challenge_pending &&
+        !rx_path->challenge_in_flight &&
+        !rx_path->response_pending) {
+        if (quic_tls_prepare_path_challenge(conn, rx_path_index, 1) != 0) {
+            return quic_tls_fail(conn, "failed to queue path validation");
+        }
+    }
+
     quic_tls_maybe_discard_keys(conn);
+    conn->ack_eliciting_sent_since_rx = 0;
+    quic_tls_restart_idle_timer(conn, now_ms);
+    quic_tls_maybe_issue_post_handshake_control(conn);
     quic_tls_arm_loss_timer(conn);
     return 0;
 }
 
 int quic_tls_conn_build_next_datagram(quic_tls_conn_t *conn, uint8_t *out, size_t out_len, size_t *written) {
+    return quic_tls_conn_build_next_datagram_on_path(conn, out, out_len, written, NULL);
+}
+
+int quic_tls_conn_build_next_datagram_on_path(quic_tls_conn_t *conn,
+                                              uint8_t *out,
+                                              size_t out_len,
+                                              size_t *written,
+                                              quic_path_addr_t *out_path) {
+    quic_tls_path_t *tx_path = NULL;
+
     if (!conn || !out || !written) {
         return quic_tls_fail(conn, "invalid build_next_datagram arguments");
+    }
+    conn->tx_path_index = conn->active_path_index;
+    if (quic_tls_has_sendable_path_control(conn)) {
+        conn->tx_path_index = conn->pending_path_index;
+    } else if (conn->path_control_pending) {
+        conn->path_control_pending = 0;
+    }
+    if (conn->tx_path_index >= conn->path_count) {
+        conn->tx_path_index = conn->active_path_index;
+    }
+    if (conn->tx_path_index < conn->path_count) {
+        tx_path = &conn->paths[conn->tx_path_index];
     }
     if (conn->conn.state == QUIC_CONN_STATE_DRAINING || conn->conn.state == QUIC_CONN_STATE_CLOSED) {
         return quic_tls_fail(conn, "connection is not allowed to send packets");
     }
     if (conn->role == QUIC_ROLE_SERVER &&
+        tx_path &&
         conn->amplification_blocked &&
-        !conn->peer_address_validated) {
+        tx_path->state != QUIC_TLS_PATH_VALIDATED) {
         *written = 0;
         return QUIC_TLS_BUILD_BLOCKED;
     }
@@ -2888,13 +3951,16 @@ int quic_tls_conn_build_next_datagram(quic_tls_conn_t *conn, uint8_t *out, size_
         if (out_len < conn->close_packet_len) {
             return quic_tls_fail(conn, "connection close output buffer too small");
         }
-        if (quic_tls_server_amplification_limited(conn, conn->close_packet_len)) {
+        if (quic_tls_server_amplification_limited_on_path(conn, tx_path, conn->close_packet_len)) {
             return quic_tls_build_blocked(conn, written);
         }
         memcpy(out, conn->close_packet, conn->close_packet_len);
         *written = conn->close_packet_len;
         conn->close_pending = 0;
         conn->close_sent = 1;
+        if (out_path && tx_path) {
+            *out_path = tx_path->addr;
+        }
         if (conn->close_enter_draining_after_send) {
             quic_tls_enter_draining(conn, conn->close_deadline_ms);
         }
@@ -2907,33 +3973,69 @@ int quic_tls_conn_build_next_datagram(quic_tls_conn_t *conn, uint8_t *out, size_
         if (out_len < conn->special_packet_len) {
             return quic_tls_fail(conn, "special packet output buffer too small");
         }
-        if (quic_tls_server_amplification_limited(conn, conn->special_packet_len)) {
+        if (quic_tls_server_amplification_limited_on_path(conn, tx_path, conn->special_packet_len)) {
             return quic_tls_build_blocked(conn, written);
         }
         memcpy(out, conn->special_packet, conn->special_packet_len);
         *written = conn->special_packet_len;
         conn->special_packet_pending = 0;
         conn->special_packet_len = 0;
+        if (out_path && tx_path) {
+            *out_path = tx_path->addr;
+        }
         quic_tls_note_packet_sent(conn, *written);
         quic_tls_arm_loss_timer(conn);
         return 0;
     }
 
     if (quic_tls_level_has_sendable_output(conn, ssl_encryption_initial)) {
-        return quic_tls_build_datagram_for_level(conn, ssl_encryption_initial, out, out_len, written);
+        int status = quic_tls_build_datagram_for_level(conn, ssl_encryption_initial, out, out_len, written);
+        if (status != 0) {
+            return status;
+        }
+        if (out_path && tx_path) {
+            *out_path = tx_path->addr;
+        }
+        return 0;
     }
     if (quic_tls_level_has_sendable_output(conn, ssl_encryption_early_data) ||
         (conn->ping_pending && conn->levels[ssl_encryption_early_data].write_secret_ready &&
          !conn->handshake_complete)) {
-        return quic_tls_build_datagram_for_level(conn, ssl_encryption_early_data, out, out_len, written);
+        int status = quic_tls_build_datagram_for_level(conn, ssl_encryption_early_data, out, out_len, written);
+        if (status != 0) {
+            return status;
+        }
+        if (out_path && tx_path) {
+            *out_path = tx_path->addr;
+        }
+        return 0;
     }
     if (quic_tls_level_has_sendable_output(conn, ssl_encryption_handshake)) {
-        return quic_tls_build_datagram_for_level(conn, ssl_encryption_handshake, out, out_len, written);
+        int status = quic_tls_build_datagram_for_level(conn, ssl_encryption_handshake, out, out_len, written);
+        if (status != 0) {
+            return status;
+        }
+        if (out_path && tx_path) {
+            *out_path = tx_path->addr;
+        }
+        return 0;
     }
     if (quic_tls_level_has_sendable_output(conn, ssl_encryption_application) ||
         ((conn->handshake_done_pending || conn->ping_pending) &&
          conn->conn.spaces[QUIC_PN_SPACE_APPLICATION].tx_keys_ready)) {
-        return quic_tls_build_datagram_for_level(conn, ssl_encryption_application, out, out_len, written);
+        int status = quic_tls_build_datagram_for_level(conn, ssl_encryption_application, out, out_len, written);
+        if (status != 0) {
+            return status;
+        }
+        if (out_path && conn->tx_path_index < conn->path_count) {
+            *out_path = conn->paths[conn->tx_path_index].addr;
+        }
+        if (tx_path && !tx_path->challenge_pending && !tx_path->challenge_in_flight &&
+            !tx_path->response_pending && !tx_path->response_in_flight &&
+            conn->path_control_pending && conn->pending_path_index == conn->tx_path_index) {
+            conn->path_control_pending = 0;
+        }
+        return 0;
     }
 
     return quic_tls_fail(conn, "no datagram pending");
@@ -2950,6 +4052,10 @@ int quic_tls_conn_has_pending_output(const quic_tls_conn_t *conn) {
         return conn->close_pending && conn->close_packet_len > 0;
     }
     return conn->special_packet_pending ||
+           conn->new_connection_id_pending ||
+           conn->retire_connection_id_pending ||
+           quic_tls_has_sendable_path_control(conn) ||
+           conn->new_token_pending ||
            quic_tls_level_has_sendable_output(conn, ssl_encryption_initial) ||
            quic_tls_level_has_sendable_output(conn, ssl_encryption_early_data) ||
            (conn->ping_pending && conn->levels[ssl_encryption_early_data].write_secret_ready && !conn->handshake_complete) ||
@@ -3020,10 +4126,90 @@ void quic_tls_conn_on_loss_timeout(quic_tls_conn_t *conn, uint64_t now_ms) {
 }
 
 uint64_t quic_tls_conn_loss_deadline_ms(const quic_tls_conn_t *conn) {
+    uint64_t deadline = 0;
+    size_t i;
+
     if (!conn || !conn->conn.timers[QUIC_CONN_TIMER_LOSS_DETECTION].armed) {
-        return 0;
+        deadline = 0;
+    } else {
+        deadline = conn->conn.timers[QUIC_CONN_TIMER_LOSS_DETECTION].deadline_ms;
     }
-    return conn->conn.timers[QUIC_CONN_TIMER_LOSS_DETECTION].deadline_ms;
+    if (conn && conn->idle_deadline_ms != 0 && (deadline == 0 || conn->idle_deadline_ms < deadline)) {
+        deadline = conn->idle_deadline_ms;
+    }
+    if (conn) {
+        for (i = 0; i < conn->path_count; i++) {
+            const quic_tls_path_t *path = &conn->paths[i];
+
+            if (path->active &&
+                path->state == QUIC_TLS_PATH_VALIDATING &&
+                path->validation_deadline_ms != 0 &&
+                (deadline == 0 || path->validation_deadline_ms < deadline)) {
+                deadline = path->validation_deadline_ms;
+            }
+        }
+    }
+    return deadline;
+}
+
+uint64_t quic_tls_conn_next_timeout_ms(const quic_tls_conn_t *conn) {
+    return quic_tls_conn_loss_deadline_ms(conn);
+}
+
+void quic_tls_conn_on_timeout(quic_tls_conn_t *conn, uint64_t now_ms) {
+    size_t i;
+
+    if (!conn) {
+        return;
+    }
+
+    if (conn->idle_deadline_ms != 0 && now_ms >= conn->idle_deadline_ms) {
+        conn->conn.state = QUIC_CONN_STATE_CLOSED;
+        conn->close_pending = 0;
+        conn->path_control_pending = 0;
+        quic_conn_disarm_timer(&conn->conn, QUIC_CONN_TIMER_IDLE);
+        quic_conn_disarm_timer(&conn->conn, QUIC_CONN_TIMER_LOSS_DETECTION);
+        return;
+    }
+
+    for (i = 0; i < conn->path_count; i++) {
+        quic_tls_path_t *path = &conn->paths[i];
+
+        if (!path->active ||
+            path->state != QUIC_TLS_PATH_VALIDATING ||
+            path->validation_deadline_ms == 0 ||
+            now_ms < path->validation_deadline_ms) {
+            continue;
+        }
+
+        path->state = QUIC_TLS_PATH_FAILED;
+        path->challenge_pending = 0;
+        path->challenge_in_flight = 0;
+        path->challenge_expected = 0;
+        path->response_pending = 0;
+        path->response_in_flight = 0;
+        path->validation_deadline_ms = 0;
+        if (conn->active_path_index == i) {
+            size_t j;
+            int found_validated = 0;
+
+            for (j = 0; j < conn->path_count; j++) {
+                if (conn->paths[j].active && conn->paths[j].state == QUIC_TLS_PATH_VALIDATED) {
+                    conn->active_path_index = j;
+                    conn->tx_path_index = j;
+                    found_validated = 1;
+                    break;
+                }
+            }
+            if (!found_validated) {
+                quic_tls_set_error(conn, "no viable validated path remains");
+                conn->conn.state = QUIC_CONN_STATE_CLOSED;
+                return;
+            }
+        }
+    }
+
+    quic_tls_conn_on_loss_timeout(conn, now_ms);
 }
 
 void quic_tls_conn_enable_retry(quic_tls_conn_t *conn, int enabled) {
@@ -3031,6 +4217,193 @@ void quic_tls_conn_enable_retry(quic_tls_conn_t *conn, int enabled) {
         return;
     }
     conn->retry_required = enabled ? 1 : 0;
+}
+
+void quic_tls_conn_set_max_idle_timeout(quic_tls_conn_t *conn, uint64_t timeout_ms) {
+    if (!conn) {
+        return;
+    }
+    conn->configured_max_idle_timeout_ms = timeout_ms;
+}
+
+int quic_tls_conn_set_initial_path(quic_tls_conn_t *conn, const quic_path_addr_t *path) {
+    quic_tls_path_t *entry;
+    size_t index = 0;
+
+    if (!conn || !path) {
+        return -1;
+    }
+    if (conn->path_count == 0) {
+        entry = quic_tls_add_path(conn,
+                                  path,
+                                  (conn->role == QUIC_ROLE_CLIENT || conn->peer_address_validated)
+                                      ? QUIC_TLS_PATH_VALIDATED
+                                      : QUIC_TLS_PATH_VALIDATING,
+                                  &index);
+        if (!entry) {
+            return quic_tls_fail(conn, "failed to add initial path");
+        }
+        conn->active_path_index = index;
+        conn->tx_path_index = index;
+    } else {
+        entry = quic_tls_ensure_path(conn, path, QUIC_TLS_PATH_VALIDATED, &index);
+        if (!entry) {
+            return quic_tls_fail(conn, "failed to update initial path");
+        }
+        conn->active_path_index = index;
+        conn->tx_path_index = index;
+    }
+    quic_tls_restart_idle_timer(conn, quic_tls_now_ms());
+    return 0;
+}
+
+int quic_tls_conn_begin_migration(quic_tls_conn_t *conn, const quic_path_addr_t *path, int use_preferred_address) {
+    quic_tls_path_t *entry;
+    size_t index = 0;
+    size_t i;
+    size_t selected_peer_index = SIZE_MAX;
+    uint64_t old_peer_sequence = UINT64_MAX;
+
+    if (!conn || !path) {
+        return -1;
+    }
+    if (!conn->handshake_complete) {
+        return quic_tls_fail(conn, "migration requires a confirmed handshake");
+    }
+    if (conn->peer_disable_active_migration && !use_preferred_address) {
+        return quic_tls_fail(conn, "peer disabled active migration");
+    }
+
+    entry = quic_tls_ensure_path(conn, path, QUIC_TLS_PATH_VALIDATING, &index);
+    if (!entry) {
+        return quic_tls_fail(conn, "failed to create migration path");
+    }
+
+    if (conn->active_peer_cid_index < conn->peer_cid_count) {
+        old_peer_sequence = conn->peer_cids[conn->active_peer_cid_index].sequence;
+    }
+
+    if (use_preferred_address && conn->peer_preferred_address.present) {
+        for (i = 0; i < conn->peer_cid_count; i++) {
+            if (conn->peer_cids[i].active &&
+                conn->peer_cids[i].cid.len == conn->peer_preferred_address.cid.len &&
+                memcmp(conn->peer_cids[i].cid.data,
+                       conn->peer_preferred_address.cid.data,
+                       conn->peer_preferred_address.cid.len) == 0) {
+                selected_peer_index = i;
+                break;
+            }
+        }
+    } else {
+        for (i = 0; i < conn->peer_cid_count; i++) {
+            if (!conn->peer_cids[i].active || conn->peer_cids[i].retired || i == conn->active_peer_cid_index) {
+                continue;
+            }
+            selected_peer_index = i;
+            break;
+        }
+    }
+
+    if (selected_peer_index == SIZE_MAX) {
+        return quic_tls_fail(conn, "no spare peer connection id for migration");
+    }
+
+    conn->active_path_index = index;
+    conn->tx_path_index = index;
+    conn->active_peer_cid_index = selected_peer_index;
+    conn->peer_cid = conn->peer_cids[selected_peer_index].cid;
+    conn->peer_cid_known = 1;
+    if (old_peer_sequence != UINT64_MAX) {
+        conn->pending_retire_sequence = old_peer_sequence;
+        conn->retire_connection_id_pending = 1;
+    }
+    if (quic_tls_prepare_path_challenge(conn, index, 1) != 0) {
+        return quic_tls_fail(conn, "failed to queue migration path challenge");
+    }
+    quic_tls_arm_loss_timer(conn);
+    return 0;
+}
+
+int quic_tls_conn_set_server_preferred_address(quic_tls_conn_t *conn,
+                                               const quic_socket_addr_t *peer_addr,
+                                               const quic_cid_t *cid,
+                                               const uint8_t *stateless_reset_token) {
+    quic_tls_cid_state_t *existing;
+
+    if (!conn || !peer_addr || !cid || !stateless_reset_token || conn->role != QUIC_ROLE_SERVER) {
+        return -1;
+    }
+    existing = quic_tls_find_local_cid_by_seq(conn, 1, NULL);
+    if (!existing) {
+        if (quic_tls_register_local_cid(conn, cid, 1, stateless_reset_token, 1) != 0) {
+            return quic_tls_fail(conn, "failed to register preferred address cid");
+        }
+        if (conn->next_local_cid_sequence <= 1) {
+            conn->next_local_cid_sequence = 2;
+        }
+    }
+    conn->local_preferred_address.present = 1;
+    conn->local_preferred_address.peer_addr = *peer_addr;
+    conn->local_preferred_address.cid = *cid;
+    memcpy(conn->local_preferred_address.stateless_reset_token,
+           stateless_reset_token,
+           QUIC_STATELESS_RESET_TOKEN_LEN);
+    return 0;
+}
+
+int quic_tls_conn_get_peer_preferred_address(const quic_tls_conn_t *conn,
+                                             quic_path_addr_t *path,
+                                             quic_cid_t *cid,
+                                             uint8_t *stateless_reset_token) {
+    if (!conn || !conn->peer_preferred_address.present) {
+        return -1;
+    }
+    if (path) {
+        if (conn->path_count == 0) {
+            return -1;
+        }
+        quic_path_addr_init(path,
+                            &conn->paths[conn->active_path_index].addr.local,
+                            &conn->peer_preferred_address.peer_addr);
+    }
+    if (cid) {
+        *cid = conn->peer_preferred_address.cid;
+    }
+    if (stateless_reset_token) {
+        memcpy(stateless_reset_token,
+               conn->peer_preferred_address.stateless_reset_token,
+               QUIC_STATELESS_RESET_TOKEN_LEN);
+    }
+    return 0;
+}
+
+int quic_tls_conn_build_stateless_reset(const quic_tls_conn_t *conn,
+                                        size_t received_datagram_len,
+                                        uint8_t *out,
+                                        size_t out_len,
+                                        size_t *written) {
+    size_t target_len;
+    const quic_tls_cid_state_t *cid;
+
+    if (!conn || !out || !written || conn->local_cid_count == 0) {
+        return -1;
+    }
+    cid = &conn->local_cids[conn->active_local_cid_index];
+    target_len = received_datagram_len > 0 && received_datagram_len > QUIC_TLS_STATELESS_RESET_MIN_LEN
+                     ? received_datagram_len - 1
+                     : QUIC_TLS_STATELESS_RESET_MIN_LEN;
+    if (target_len > out_len || target_len < QUIC_TLS_STATELESS_RESET_MIN_LEN) {
+        return -1;
+    }
+    if (quic_tls_fill_random_bytes(out, target_len) != 0) {
+        return -1;
+    }
+    out[0] = (uint8_t)((out[0] & 0x3f) | 0x40);
+    memcpy(out + target_len - QUIC_STATELESS_RESET_TOKEN_LEN,
+           cid->stateless_reset_token,
+           QUIC_STATELESS_RESET_TOKEN_LEN);
+    *written = target_len;
+    return 0;
 }
 
 void quic_tls_conn_set_initial_flow_control(quic_tls_conn_t *conn,

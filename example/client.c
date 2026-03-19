@@ -40,6 +40,55 @@ static quic_cid_t make_cid(uint8_t seed) {
     return cid;
 }
 
+static void sockaddr_in_to_quic_addr(const struct sockaddr_in *src, quic_socket_addr_t *dst) {
+    uint32_t ip;
+
+    if (!src || !dst) {
+        return;
+    }
+    ip = ntohl(src->sin_addr.s_addr);
+    quic_socket_addr_init_ipv4(dst,
+                               (uint8_t)((ip >> 24) & 0xff),
+                               (uint8_t)((ip >> 16) & 0xff),
+                               (uint8_t)((ip >> 8) & 0xff),
+                               (uint8_t)(ip & 0xff),
+                               ntohs(src->sin_port));
+}
+
+static void quic_addr_to_sockaddr_in(const quic_socket_addr_t *src, struct sockaddr_in *dst) {
+    uint32_t ip;
+
+    if (!src || !dst) {
+        return;
+    }
+    memset(dst, 0, sizeof(*dst));
+    dst->sin_family = AF_INET;
+    dst->sin_port = htons(src->port);
+    ip = ((uint32_t)src->addr[0] << 24) |
+         ((uint32_t)src->addr[1] << 16) |
+         ((uint32_t)src->addr[2] << 8) |
+         (uint32_t)src->addr[3];
+    dst->sin_addr.s_addr = htonl(ip);
+}
+
+static int connected_socket_path(int fd, const struct sockaddr_in *peer_addr, quic_path_addr_t *path) {
+    struct sockaddr_in local_addr;
+    socklen_t local_len = sizeof(local_addr);
+    quic_socket_addr_t local;
+    quic_socket_addr_t peer;
+
+    if (fd < 0 || !peer_addr || !path) {
+        return -1;
+    }
+    if (getsockname(fd, (struct sockaddr *)&local_addr, &local_len) != 0) {
+        return -1;
+    }
+    sockaddr_in_to_quic_addr(&local_addr, &local);
+    sockaddr_in_to_quic_addr(peer_addr, &peer);
+    quic_path_addr_init(path, &local, &peer);
+    return 0;
+}
+
 static void byte_buffer_init(byte_buffer_t *buf) {
     if (!buf) {
         return;
@@ -160,14 +209,25 @@ static int send_pending_packets(int fd, quic_tls_conn_t *conn) {
     while (quic_tls_conn_has_pending_output(conn)) {
         uint8_t packet[QUIC_TLS_MAX_DATAGRAM_SIZE];
         size_t packet_len = 0;
+        quic_path_addr_t send_path;
+        struct sockaddr_in peer_addr;
         int build_status;
 
-        build_status = quic_tls_conn_build_next_datagram(conn, packet, sizeof(packet), &packet_len);
+        build_status = quic_tls_conn_build_next_datagram_on_path(conn,
+                                                                 packet,
+                                                                 sizeof(packet),
+                                                                 &packet_len,
+                                                                 &send_path);
         if (build_status == QUIC_TLS_BUILD_BLOCKED) {
             break;
         }
         if (build_status != 0) {
             fprintf(stderr, "client build packet failed: %s\n", quic_tls_conn_last_error(conn));
+            return -1;
+        }
+        quic_addr_to_sockaddr_in(&send_path.peer, &peer_addr);
+        if (connect(fd, (const struct sockaddr *)&peer_addr, sizeof(peer_addr)) != 0) {
+            perror("client reconnect");
             return -1;
         }
         if (send(fd, packet, packet_len, 0) < 0) {
@@ -270,9 +330,14 @@ int main(int argc, char **argv) {
     int port = DEFAULT_PORT;
     const char *upload_file = NULL;
     const char *download_file = NULL;
+    int preferred_port = 0;
+    int migration_enabled = 0;
+    int migration_started = 0;
     int file_mode = 0;
     int fd = -1;
     struct sockaddr_in server_addr;
+    quic_path_addr_t initial_path;
+    quic_path_addr_t preferred_path;
     quic_tls_conn_t conn;
     quic_cid_t client_scid = make_cid(0x10);
     quic_cid_t client_odcid = make_cid(0xa0);
@@ -321,11 +386,16 @@ int main(int argc, char **argv) {
     if (argc > 4) {
         download_file = argv[4];
     }
+    if (argc > 5) {
+        preferred_port = atoi(argv[5]);
+    }
     if ((upload_file && !download_file) || (!upload_file && download_file)) {
         fprintf(stderr, "client requires both upload and download file paths\n");
         return 1;
     }
     file_mode = (upload_file && download_file) ? 1 : 0;
+    migration_enabled = preferred_port > 0;
+    migration_started = migration_enabled ? 0 : 1;
 
     if (file_mode) {
         if (load_file(upload_file, &upload_payload) != 0) {
@@ -392,6 +462,17 @@ int main(int argc, char **argv) {
     }
     if (connect(fd, (struct sockaddr *)&server_addr, sizeof(server_addr)) != 0) {
         perror("client connect");
+        close(fd);
+        quic_tls_conn_free(&conn);
+        byte_buffer_free(&upload_payload);
+        byte_buffer_free(&response0);
+        byte_buffer_free(&response1);
+        byte_buffer_free(&response8);
+        return 1;
+    }
+    if (connected_socket_path(fd, &server_addr, &initial_path) != 0 ||
+        quic_tls_conn_set_initial_path(&conn, &initial_path) != 0) {
+        fprintf(stderr, "client failed to set initial path: %s\n", quic_tls_conn_last_error(&conn));
         close(fd);
         quic_tls_conn_free(&conn);
         byte_buffer_free(&upload_payload);
@@ -486,7 +567,48 @@ int main(int argc, char **argv) {
                 byte_buffer_free(&response8);
                 return 1;
             }
-            if (quic_tls_conn_handshake_complete(&conn) && !app_started) {
+            if (quic_tls_conn_handshake_complete(&conn) &&
+                migration_enabled &&
+                !app_started &&
+                quic_tls_conn_get_peer_preferred_address(&conn, &preferred_path, NULL, NULL) == 0) {
+                struct sockaddr_in preferred_addr;
+
+                fprintf(stderr, "client learned preferred address port=%u\n", preferred_path.peer.port);
+
+                if (quic_tls_conn_begin_migration(&conn, &preferred_path, 1) != 0) {
+                    fprintf(stderr, "client preferred-address migration failed: %s\n", quic_tls_conn_last_error(&conn));
+                    close(fd);
+                    quic_tls_conn_free(&conn);
+                    byte_buffer_free(&upload_payload);
+                    byte_buffer_free(&response0);
+                    byte_buffer_free(&response1);
+                    byte_buffer_free(&response8);
+                    return 1;
+                }
+                quic_addr_to_sockaddr_in(&preferred_path.peer, &preferred_addr);
+                if (connect(fd, (struct sockaddr *)&preferred_addr, sizeof(preferred_addr)) != 0) {
+                    perror("client connect preferred");
+                    close(fd);
+                    quic_tls_conn_free(&conn);
+                    byte_buffer_free(&upload_payload);
+                    byte_buffer_free(&response0);
+                    byte_buffer_free(&response1);
+                    byte_buffer_free(&response8);
+                    return 1;
+                }
+                if (send_pending_packets(fd, &conn) != 0) {
+                    close(fd);
+                    quic_tls_conn_free(&conn);
+                    byte_buffer_free(&upload_payload);
+                    byte_buffer_free(&response0);
+                    byte_buffer_free(&response1);
+                    byte_buffer_free(&response8);
+                    return 1;
+                }
+                migration_started = 1;
+                fprintf(stderr, "client started preferred-address migration\n");
+            }
+            if (quic_tls_conn_handshake_complete(&conn) && migration_started && !app_started) {
                 const uint8_t *stream0_payload = file_mode ? upload_payload.data : request0;
                 size_t stream0_len = file_mode ? upload_payload.len : (sizeof(request0) - 1);
                 const uint8_t *stream4_payload = file_mode ? download_request : request1;

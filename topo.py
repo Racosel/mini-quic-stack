@@ -31,6 +31,7 @@ SERVER_CERT = CERT_DIR / "server_cert.pem"
 SERVER_KEY = CERT_DIR / "server_key.pem"
 SERVER_READY_MARKER = "server listening on "
 SERVER_READY_TIMEOUT_S = 10.0
+STAGE5_PREFERRED_PORT = 4445
 ANSI_RESET = "\033[0m"
 ANSI_ERROR_BG = "\033[41;97m"
 ANSI_DONE_BG = "\033[42;30m"
@@ -75,6 +76,16 @@ NETWORK_PROFILES = {
         "server_loss_pct": 0.0,
         "upload_size": 4096,
         "download_size": 4096,
+    },
+    "preferred-address": {
+        "description": "阶段 5 preferred-address 迁移后继续文件传输",
+        "bw_mbit": 100,
+        "client_delay_ms": 20,
+        "server_delay_ms": 10,
+        "client_loss_pct": 0.0,
+        "server_loss_pct": 0.0,
+        "upload_size": 65536,
+        "download_size": 49152,
     },
 }
 
@@ -307,14 +318,15 @@ def run_single_auto_validation(net: Mininet,
 
     info(f"*** 第 {round_index}/{rounds} 轮自动验证 ({profile_name}: {profile['description']}) ***\n")
     if auto_file_mode:
+        extra_args = f" {STAGE5_PREFERRED_PORT}" if profile_name == "preferred-address" else ""
         server_cmd = (
             f"cd {repo_root} && "
             f"./{SERVER_BIN} 10.0.0.2 4434 {SERVER_CERT} {SERVER_KEY} "
-            f"{SERVER_RECEIVED_FILE} {DOWNLOAD_SOURCE_FILE}"
+            f"{SERVER_RECEIVED_FILE} {DOWNLOAD_SOURCE_FILE}{extra_args}"
         )
         client_cmd = (
             f"cd {repo_root} && "
-            f"./{CLIENT_BIN} 10.0.0.2 4434 {UPLOAD_FILE} {CLIENT_DOWNLOADED_FILE}"
+            f"./{CLIENT_BIN} 10.0.0.2 4434 {UPLOAD_FILE} {CLIENT_DOWNLOADED_FILE}{extra_args}"
         )
     else:
         server_cmd = (

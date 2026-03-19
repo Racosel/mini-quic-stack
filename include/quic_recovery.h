@@ -27,10 +27,19 @@ typedef struct {
     uint8_t includes_stop_sending;
     uint8_t includes_reset_stream;
     uint8_t includes_max_stream_data;
+    uint8_t includes_new_connection_id;
+    uint8_t includes_retire_connection_id;
+    uint8_t includes_path_challenge;
+    uint8_t includes_path_response;
+    uint8_t includes_new_token;
     uint64_t stream_id;
     uint64_t control_stream_id;
     uint64_t stream_offset;
     uint64_t stream_length;
+    uint64_t cid_sequence;
+    uint64_t retire_sequence;
+    uint64_t path_challenge_token;
+    uint8_t path_id;
 } quic_sent_packet_meta_t;
 
 // 记录已发送包的元数据

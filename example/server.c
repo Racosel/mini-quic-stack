@@ -41,6 +41,51 @@ static quic_cid_t make_cid(uint8_t seed) {
     return cid;
 }
 
+static void sockaddr_in_to_quic_addr(const struct sockaddr_in *src, quic_socket_addr_t *dst) {
+    uint32_t ip;
+
+    if (!src || !dst) {
+        return;
+    }
+    ip = ntohl(src->sin_addr.s_addr);
+    quic_socket_addr_init_ipv4(dst,
+                               (uint8_t)((ip >> 24) & 0xff),
+                               (uint8_t)((ip >> 16) & 0xff),
+                               (uint8_t)((ip >> 8) & 0xff),
+                               (uint8_t)(ip & 0xff),
+                               ntohs(src->sin_port));
+}
+
+static void quic_addr_to_sockaddr_in(const quic_socket_addr_t *src, struct sockaddr_in *dst) {
+    uint32_t ip;
+
+    if (!src || !dst) {
+        return;
+    }
+    memset(dst, 0, sizeof(*dst));
+    dst->sin_family = AF_INET;
+    dst->sin_port = htons(src->port);
+    ip = ((uint32_t)src->addr[0] << 24) |
+         ((uint32_t)src->addr[1] << 16) |
+         ((uint32_t)src->addr[2] << 8) |
+         (uint32_t)src->addr[3];
+    dst->sin_addr.s_addr = htonl(ip);
+}
+
+static void make_recv_path(const struct sockaddr_in *local_addr,
+                           const struct sockaddr_in *peer_addr,
+                           quic_path_addr_t *path) {
+    quic_socket_addr_t local;
+    quic_socket_addr_t peer;
+
+    if (!local_addr || !peer_addr || !path) {
+        return;
+    }
+    sockaddr_in_to_quic_addr(local_addr, &local);
+    sockaddr_in_to_quic_addr(peer_addr, &peer);
+    quic_path_addr_init(path, &local, &peer);
+}
+
 static void byte_buffer_init(byte_buffer_t *buf) {
     if (!buf) {
         return;
@@ -157,16 +202,23 @@ static void sha256_hex(const uint8_t *data, size_t len, char out[65]) {
     out[64] = '\0';
 }
 
-static int send_pending_packets(int fd,
-                                quic_tls_conn_t *conn,
-                                const struct sockaddr_in *peer_addr,
-                                socklen_t peer_len) {
+static int send_pending_packets(int primary_fd,
+                                int preferred_fd,
+                                uint16_t preferred_port,
+                                quic_tls_conn_t *conn) {
     while (quic_tls_conn_has_pending_output(conn)) {
         uint8_t packet[QUIC_TLS_MAX_DATAGRAM_SIZE];
         size_t packet_len = 0;
+        quic_path_addr_t send_path;
+        struct sockaddr_in peer_addr;
+        int send_fd;
         int build_status;
 
-        build_status = quic_tls_conn_build_next_datagram(conn, packet, sizeof(packet), &packet_len);
+        build_status = quic_tls_conn_build_next_datagram_on_path(conn,
+                                                                 packet,
+                                                                 sizeof(packet),
+                                                                 &packet_len,
+                                                                 &send_path);
         if (build_status == QUIC_TLS_BUILD_BLOCKED) {
             // RFC 9000/9002: anti-amplification only blocks sends temporarily.
             break;
@@ -175,7 +227,9 @@ static int send_pending_packets(int fd,
             fprintf(stderr, "server build packet failed: %s\n", quic_tls_conn_last_error(conn));
             return -1;
         }
-        if (sendto(fd, packet, packet_len, 0, (const struct sockaddr *)peer_addr, peer_len) < 0) {
+        quic_addr_to_sockaddr_in(&send_path.peer, &peer_addr);
+        send_fd = (preferred_fd >= 0 && send_path.local.port == preferred_port) ? preferred_fd : primary_fd;
+        if (sendto(send_fd, packet, packet_len, 0, (const struct sockaddr *)&peer_addr, sizeof(peer_addr)) < 0) {
             perror("server sendto");
             return -1;
         }
@@ -254,14 +308,21 @@ int main(int argc, char **argv) {
     const char *key_file = DEFAULT_KEY;
     const char *receive_file = NULL;
     const char *send_file = NULL;
+    int preferred_port = 0;
     int file_mode = 0;
     int port = DEFAULT_PORT;
     int fd = -1;
+    int preferred_fd = -1;
     struct sockaddr_in local_addr;
+    struct sockaddr_in preferred_local_addr;
     struct sockaddr_in peer_addr;
+    struct sockaddr_in recv_local_addr;
     socklen_t peer_len = sizeof(peer_addr);
+    quic_path_addr_t recv_path;
     quic_tls_conn_t conn;
     quic_cid_t local_cid = make_cid(0xb0);
+    quic_cid_t preferred_cid = make_cid(0xd0);
+    uint8_t preferred_token[QUIC_STATELESS_RESET_TOKEN_LEN];
     byte_buffer_t request0;
     byte_buffer_t request4;
     byte_buffer_t request8;
@@ -284,6 +345,7 @@ int main(int argc, char **argv) {
     uint64_t deadline = now_ms() + 15000;
     ssize_t recv_len;
     uint8_t buffer[QUIC_TLS_MAX_DATAGRAM_SIZE];
+    size_t i;
 
     byte_buffer_init(&request0);
     byte_buffer_init(&request4);
@@ -308,11 +370,17 @@ int main(int argc, char **argv) {
     if (argc > 6) {
         send_file = argv[6];
     }
+    if (argc > 7) {
+        preferred_port = atoi(argv[7]);
+    }
     if ((receive_file && !send_file) || (!receive_file && send_file)) {
         fprintf(stderr, "server requires both receive and send file paths\n");
         return 1;
     }
     file_mode = (receive_file && send_file) ? 1 : 0;
+    for (i = 0; i < sizeof(preferred_token); i++) {
+        preferred_token[i] = (uint8_t)(0xe0 + i);
+    }
     if (file_mode && load_file(send_file, &send_payload) != 0) {
         byte_buffer_free(&request0);
         byte_buffer_free(&request4);
@@ -362,6 +430,30 @@ int main(int argc, char **argv) {
         byte_buffer_free(&send_payload);
         return 1;
     }
+    if (preferred_port > 0) {
+        quic_socket_addr_t preferred_addr;
+        uint32_t ip = ntohl(local_addr.sin_addr.s_addr);
+
+        quic_socket_addr_init_ipv4(&preferred_addr,
+                                   (uint8_t)((ip >> 24) & 0xff),
+                                   (uint8_t)((ip >> 16) & 0xff),
+                                   (uint8_t)((ip >> 8) & 0xff),
+                                   (uint8_t)(ip & 0xff),
+                                   (uint16_t)preferred_port);
+        if (quic_tls_conn_set_server_preferred_address(&conn,
+                                                       &preferred_addr,
+                                                       &preferred_cid,
+                                                       preferred_token) != 0) {
+            fprintf(stderr, "server preferred address setup failed: %s\n", quic_tls_conn_last_error(&conn));
+            close(fd);
+            quic_tls_conn_free(&conn);
+            byte_buffer_free(&request0);
+            byte_buffer_free(&request4);
+            byte_buffer_free(&request8);
+            byte_buffer_free(&send_payload);
+            return 1;
+        }
+    }
     if (bind(fd, (struct sockaddr *)&local_addr, sizeof(local_addr)) != 0) {
         perror("server bind");
         close(fd);
@@ -372,12 +464,42 @@ int main(int argc, char **argv) {
         byte_buffer_free(&send_payload);
         return 1;
     }
-
-    printf("server listening on %s:%d\n", bind_ip, port);
+    if (preferred_port > 0) {
+        preferred_fd = socket(AF_INET, SOCK_DGRAM, 0);
+        if (preferred_fd < 0) {
+            perror("server preferred socket");
+            close(fd);
+            quic_tls_conn_free(&conn);
+            byte_buffer_free(&request0);
+            byte_buffer_free(&request4);
+            byte_buffer_free(&request8);
+            byte_buffer_free(&send_payload);
+            return 1;
+        }
+        memset(&preferred_local_addr, 0, sizeof(preferred_local_addr));
+        preferred_local_addr.sin_family = AF_INET;
+        preferred_local_addr.sin_port = htons((uint16_t)preferred_port);
+        preferred_local_addr.sin_addr = local_addr.sin_addr;
+        if (bind(preferred_fd, (struct sockaddr *)&preferred_local_addr, sizeof(preferred_local_addr)) != 0) {
+            perror("server preferred bind");
+            close(preferred_fd);
+            close(fd);
+            quic_tls_conn_free(&conn);
+            byte_buffer_free(&request0);
+            byte_buffer_free(&request4);
+            byte_buffer_free(&request8);
+            byte_buffer_free(&send_payload);
+            return 1;
+        }
+        printf("server listening on %s:%d (preferred %d)\n", bind_ip, port, preferred_port);
+    } else {
+        printf("server listening on %s:%d\n", bind_ip, port);
+    }
     fflush(stdout);
 
     while (now_ms() < deadline) {
-        struct pollfd pfd;
+        struct pollfd pfds[2];
+        nfds_t poll_count = preferred_fd >= 0 ? 2U : 1U;
         int timeout_ms = 50;
         uint64_t loss_deadline = quic_tls_conn_loss_deadline_ms(&conn);
         uint64_t now = now_ms();
@@ -407,7 +529,7 @@ int main(int argc, char **argv) {
         }
 
         if (peer_known && quic_tls_conn_has_pending_output(&conn)) {
-            if (send_pending_packets(fd, &conn, &peer_addr, peer_len) != 0) {
+            if (send_pending_packets(fd, preferred_fd, (uint16_t)preferred_port, &conn) != 0) {
                 close(fd);
                 quic_tls_conn_free(&conn);
                 byte_buffer_free(&request0);
@@ -429,10 +551,15 @@ int main(int argc, char **argv) {
             }
         }
 
-        pfd.fd = fd;
-        pfd.events = POLLIN;
-        pfd.revents = 0;
-        if (poll(&pfd, 1, timeout_ms) < 0) {
+        pfds[0].fd = fd;
+        pfds[0].events = POLLIN;
+        pfds[0].revents = 0;
+        if (preferred_fd >= 0) {
+            pfds[1].fd = preferred_fd;
+            pfds[1].events = POLLIN;
+            pfds[1].revents = 0;
+        }
+        if (poll(pfds, poll_count, timeout_ms) < 0) {
             perror("server poll");
             close(fd);
             quic_tls_conn_free(&conn);
@@ -443,8 +570,12 @@ int main(int argc, char **argv) {
             return 1;
         }
 
-        if ((pfd.revents & POLLIN) != 0) {
-            recv_len = recvfrom(fd, buffer, sizeof(buffer), 0, (struct sockaddr *)&peer_addr, &peer_len);
+        if ((pfds[0].revents & POLLIN) != 0 || (preferred_fd >= 0 && (pfds[1].revents & POLLIN) != 0)) {
+            int recv_fd = (preferred_fd >= 0 && (pfds[1].revents & POLLIN) != 0) ? preferred_fd : fd;
+
+            recv_local_addr = (recv_fd == preferred_fd) ? preferred_local_addr : local_addr;
+            peer_len = sizeof(peer_addr);
+            recv_len = recvfrom(recv_fd, buffer, sizeof(buffer), 0, (struct sockaddr *)&peer_addr, &peer_len);
             if (recv_len < 0) {
                 if (errno == EINTR) {
                     continue;
@@ -459,7 +590,8 @@ int main(int argc, char **argv) {
                 return 1;
             }
             peer_known = 1;
-            if (quic_tls_conn_handle_datagram(&conn, buffer, (size_t)recv_len) != 0) {
+            make_recv_path(&recv_local_addr, &peer_addr, &recv_path);
+            if (quic_tls_conn_handle_datagram_on_path(&conn, buffer, (size_t)recv_len, &recv_path) != 0) {
                 fprintf(stderr, "server handle datagram failed: %s\n", quic_tls_conn_last_error(&conn));
                 close(fd);
                 quic_tls_conn_free(&conn);
@@ -473,6 +605,9 @@ int main(int argc, char **argv) {
                 quic_tls_conn_queue_ping(&conn);
                 ping_enqueued = 1;
                 app_started = 1;
+                if (preferred_port > 0) {
+                    fprintf(stderr, "server handshake complete and preferred-address mode is active\n");
+                }
             }
             if (app_started) {
                 if (drain_stream(&conn, 0, &request0, &request0_fin) < 0 ||
@@ -642,7 +777,7 @@ int main(int argc, char **argv) {
                 }
             }
             if (peer_known && quic_tls_conn_has_pending_output(&conn)) {
-                if (send_pending_packets(fd, &conn, &peer_addr, peer_len) != 0) {
+                if (send_pending_packets(fd, preferred_fd, (uint16_t)preferred_port, &conn) != 0) {
                     close(fd);
                     quic_tls_conn_free(&conn);
                     byte_buffer_free(&request0);

@@ -342,6 +342,181 @@ sudo python3 topo.py --auto-file --profile lossy-recovery --bw 100 --delay 20 --
 
 阶段 5：实现连接管理与迁移能力。补齐 CID 生命周期、NEW_CONNECTION_ID/RETIRE_CONNECTION_ID 语义、path validation、connection migration、preferred_address、stateless reset、idle timeout、close/error handling、token 与地址验证。完成标志是连接不仅能“建立和传数据”，还能正确处理迁移、关闭和异常路径。
 
+#### 阶段 5 设计细化
+
+阶段 5 的目标不是继续堆叠“能收发一些控制帧”，而是把阶段 4 已经稳定下来的收发与恢复主体，扩展成真正具备连接生命周期管理能力的 QUIC 连接。设计时应优先对照 RFC 9000 的以下章节：Section 5.1（Connection ID）、Section 8（Address Validation）、Section 9（Connection Migration）、Section 10（Connection Termination）、Section 18.2（Transport Parameters）、Section 19.15-19.18（NEW_CONNECTION_ID / RETIRE_CONNECTION_ID / PATH_CHALLENGE / PATH_RESPONSE）。
+
+##### 1. 设计边界
+
+- 本阶段先做 RFC 9000 的单路径迁移与连接管理主体，不同时引入 multipath、Key Update 或更复杂的地址共享策略。
+- 必须显式区分 5 类行为，不能混成一个“地址变了就切换”的粗糙状态机：
+  - 初始建连期的地址验证与 token 校验
+  - NAT rebinding / 被动地址变化
+  - 主动 connection migration
+  - `preferred_address` 驱动的服务端地址切换
+  - 连接终止路径：`idle timeout`、`CONNECTION_CLOSE`、`stateless reset`
+- 必须把“仍有连接状态”和“已丢失连接状态”区分开来：
+  - 有状态终止走 `CONNECTION_CLOSE` + `closing/draining`
+  - 无状态终止才允许走 `stateless reset`
+- 不能把阶段 4 的单个连接级 anti-amplification 逻辑直接复用为阶段 5 的路径逻辑；迁移后至少要能按 path 追踪“收到多少字节、在验证前允许发多少字节、是否已验证”。
+
+##### 2. 建议的数据结构与模块划分
+
+- 在连接对象下新增本地 CID 表与对端 CID 表，至少记录：
+  - `sequence`
+  - `cid`
+  - `stateless_reset_token`
+  - `retire_prior_to`
+  - `acked`
+  - `retire_pending`
+  - `retired`
+  - `in_use_path`
+- 新增 path 表，而不是只在连接对象里保存一个远端地址。每个 path 至少记录：
+  - `local_addr`
+  - `peer_addr`
+  - `state`：`unknown` / `validating` / `validated` / `failed`
+  - `bytes_received`
+  - `bytes_sent_before_validation`
+  - `challenge_data`
+  - `challenge_in_flight`
+  - `validation_deadline`
+  - `mtu_validated`
+  - 与阶段 4 恢复模块对接所需的 path 级 RTT 初值或引用
+- 新增 token 管理状态，区分：
+  - `Retry token`
+  - `NEW_TOKEN` 发放的 address validation token
+  - token 所属 QUIC version
+  - token 过期时间 / 一次性使用状态
+- 连接关闭路径应从普通发送路径中抽离，独立维护：
+  - `effective_idle_timeout`
+  - `idle_deadline`
+  - `closing_deadline`
+  - `draining_deadline`
+  - 当前 close reason / application error
+- 从代码组织上，建议至少拆成以下模块，而不是继续把所有 path/CID/close 逻辑塞进 `quic_tls.c`：
+  - `src/transport/quic_cid.c`
+  - `src/transport/quic_path.c`
+  - `src/transport/quic_token.c`
+  - `src/transport/quic_termination.c`
+
+##### 3. 推荐的实现顺序
+
+1. 先补 transport parameters 的语义执行，而不只是解析：
+   - `active_connection_id_limit`
+   - `disable_active_migration`
+   - `preferred_address`
+   - `stateless_reset_token`
+   - `max_idle_timeout`
+2. 实现 `NEW_CONNECTION_ID` / `RETIRE_CONNECTION_ID` 的本地状态机：
+   - sequence 单调递增
+   - `Retire Prior To` 处理
+   - 重复帧幂等
+   - 超过 `active_connection_id_limit` 时的错误路径
+3. 实现 token 生命周期：
+   - Retry token
+   - `NEW_TOKEN` token
+   - token 与 QUIC version 绑定
+   - token 过期与一次性消费
+4. 实现 path validation：
+   - `PATH_CHALLENGE`
+   - `PATH_RESPONSE`
+   - challenge data 跟踪
+   - validation timeout
+   - 1200-byte 扩展要求
+5. 在 path validation 之上接 NAT rebinding 与主动迁移：
+   - 握手确认前禁止主动迁移
+   - 新 path 上使用新的 peer CID
+   - 验证成功前限制发送
+6. 再实现 `preferred_address`：
+   - 客户端收到服务端 `preferred_address` 后切换地址
+   - 切换必须走 path validation，而不是直接认定成功
+7. 最后实现连接终止完整路径：
+   - `idle timeout`
+   - liveness `PING`
+   - `closing/draining`
+   - `stateless reset` 的生成与检测
+
+##### 4. 测试设计
+
+阶段 5 不应只靠一次 `topo.py` 跑通。建议像阶段 4 一样拆成 3 层。
+
+第一层：CID / token / termination 纯状态机测试，建议新增 `tests/test_phase18.c`
+
+- 直接在内存内验证：
+  - `NEW_CONNECTION_ID` 重复接收是否幂等
+  - `Retire Prior To` 是否正确驱动本地 retirement
+  - `active_connection_id_limit` 超限是否触发 `CONNECTION_ID_LIMIT_ERROR`
+  - `RETIRE_CONNECTION_ID` 是否只允许 retire 已发放的 sequence
+  - `max_idle_timeout` 的 effective value 是否取双方最小值
+  - idle timer 是否只在“成功处理入站包”或“首次 ack-eliciting 发送”后重置
+  - `closing` / `draining` 是否遵守“三倍 PTO”量级的保留时间
+  - stateless reset token 是否只对 active / used CID 生效
+
+第二层：path validation 与迁移状态机测试，建议新增 `tests/test_phase19.c`
+
+- 不依赖 Mininet，直接驱动两端连接对象，验证：
+  - `PATH_CHALLENGE` 必须带不可预测的 8 字节数据
+  - `PATH_RESPONSE` 只能回显已收到的 challenge，且每个 challenge 只回一次
+  - 新 path 在验证成功前不能被视为 fully validated
+  - 验证失败定时器应接近 RFC 9000 推荐的 `3 * max(current PTO, new-path PTO)`
+  - `disable_active_migration` 打开时，主动迁移应被拒绝或只做丢弃/验证而不直接切换
+  - `preferred_address` 切换必须走完整 path validation
+  - NAT rebinding 不应被误判成协议错误或直接关连接
+
+第三层：真实网络验证，建议新增 `tests/test_phase20.c` 与 `topo.py` 的 stage5 profile
+
+- 这里验证的重点不再是“能否传一个文件”，而是：
+  - bulk 传输进行中触发客户端地址变化，连接是否保持
+  - bulk 传输进行中切到 `preferred_address`，是否仍能完成
+  - 空闲一段时间后，`idle timeout` 是否按协商值关闭
+  - 关闭后继续收到旧包时，是否进入正确的 `closing/draining/stateless reset` 路径
+  - 服务器丢状态或重启后，客户端是否能把 trailing token 正确识别为 stateless reset
+
+##### 5. 是否需要改动网络拓扑
+
+与阶段 4 不同，阶段 5 仅靠现有“两个主机、一条稳定 path”的默认运行模式不够。要合理测试 migration，拓扑或地址配置至少要支持“同一连接切换到另一条地址路径”。
+
+- 最小改法不是引入复杂多交换机，而是给 `h1` 和 `h2` 各准备两组地址或两块接口，使同一主机能在测试中切到另一条 path。
+- 如果 Mininet 脚本实现更方便，也可以保留单交换机结构，但为主机增加第二接口：
+  - 初始路径：`h1-eth0 <-> s1 <-> h2-eth0`
+  - 迁移路径：`h1-eth1 <-> s1 <-> h2-eth1`
+- `preferred_address` 测试更适合服务端具备第二地址，而不是只换端口。
+- `stateless reset` 测试不一定需要新增主机，但需要脚本能够模拟“服务端失去连接状态后仍收到旧连接包”。
+- 阶段 5 不必一开始就引入 cross traffic 主机；真实重点是地址变化与 path validation，不是公平性。
+
+##### 6. 推荐的 stage5 profile 与流量特征
+
+为了把连接管理问题和普通丢包/拥塞问题区分开，建议至少准备以下 profile：
+
+- `nat-rebind`：
+  - 传输中只改变客户端源地址/端口，验证被动地址变化与 CID 切换。
+- `active-migration`：
+  - 传输中主动切到另一接口或另一 IP，验证 path validation 与新 CID 使用。
+- `preferred-address`：
+  - 握手后由客户端切向服务端 `preferred_address`，验证服务端给出的 CID 与 reset token 语义。
+- `idle-timeout`：
+  - 先完成少量数据交换，再静默超过协商超时，验证双方是否按 effective timeout 清理连接。
+- `stateless-reset`：
+  - 服务器在建立连接后丢失状态，客户端继续发包，验证 reset 检测与进入 draining。
+
+阶段 5 的真实流量特征也应调整：
+
+- 迁移必须发生在连接已建立且有持续数据流时，不能只在空连接上做一次 `PATH_CHALLENGE`。
+- 至少保留一个长 stream 或文件传输作为迁移载荷，避免“迁移成功但应用面其实已经结束”。
+- `idle-timeout` 场景需要显式静默窗口，而不是靠脚本 sleep 后立即退出。
+- `stateless-reset` 场景需要在 reset 后继续观察客户端是否停止发包，而不是只看一条日志。
+
+##### 7. 文档与脚本同步要求
+
+- `topo.py` 需要为阶段 5 预留新的控制参数，例如：
+  - `--migrate-after-ms`
+  - `--migrate-after-bytes`
+  - `--preferred-address`
+  - `--idle-wait-ms`
+  - `--drop-server-state`
+- `example/client.c` / `example/server.c` 需要暴露 path/CID 事件日志，否则拓扑测试很难区分“连接还活着”与“其实只是重新建了一个连接”。
+- 阶段 5 完成前，README 中“已完成能力”不应提前宣称迁移或 stateless reset 已实现；只有 `test_phase18/19/20` 与对应 `topo.py` profile 稳定通过后，才能把这一阶段标记为完成。
+
 阶段 6：接应用层与做互操作收尾。最后再接 HTTP/3 或至少一个稳定的应用层 demo，补 qlog/metrics/fuzzing/interop tests，和 quiche、ngtcp2、msquic 这类实现做互通验证。完成标志是仓库不再只是协议构件集合，而是一个可对外使用、可验证、可调试的完整 QUIC 栈。
 
 如果你要更可执行一点，我下一步可以把这 7 个阶段继续展开成“每阶段需要新增哪些 .c/.h 文件、哪些测试目标、哪些 RFC 小节对应到哪些实现任务”的开发计划。
