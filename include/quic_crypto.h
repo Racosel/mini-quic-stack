@@ -21,7 +21,8 @@ typedef struct {
     quic_crypto_level_ctx_t server_initial;
 } quic_crypto_context_t;
 
-// 基于 TLS 提供的 QUIC secret 推导该级别的包保护密钥
+// 功能：基于 TLS 提供的 QUIC secret 推导某个加密级别的包保护密钥材料。
+// 返回值：0 表示成功；< 0 表示 HKDF/参数处理失败。
 int quic_crypto_derive_packet_keys(
     const uint8_t *secret,
     size_t secret_len,
@@ -29,10 +30,12 @@ int quic_crypto_derive_packet_keys(
     quic_crypto_level_ctx_t *ctx
 );
 
-// 清空某个加密级别的密钥材料
+// 功能：清空某个加密级别的密钥材料。
+// 返回值：无。
 void quic_crypto_discard_level(quic_crypto_level_ctx_t *ctx);
 
-// 初始化 QUIC 的 Initial 密钥上下文
+// 功能：根据 DCID 和版本操作集初始化客户端/服务端 Initial 密钥上下文。
+// 返回值：0 表示成功；< 0 表示版本不支持或密钥派生失败。
 int quic_crypto_setup_initial_keys(
     const quic_cid_t *dcid, 
     const quic_version_ops_t *v_ops, 

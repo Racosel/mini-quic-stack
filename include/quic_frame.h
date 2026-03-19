@@ -45,7 +45,8 @@ typedef struct {
     uint8_t fin;
 } quic_stream_frame_t;
 
-// 轮询解析一段连续的明文载荷
+// 功能：轮询解析一段连续的明文载荷，并按帧类型进行语法级遍历。
+// 返回值：0 表示整段载荷遍历成功；< 0 表示遇到长度错误或帧语法错误。
 int quic_parse_frames(const uint8_t *payload, size_t payload_len);
 
 #endif // QUIC_FRAME_H：头文件保护结束

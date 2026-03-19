@@ -198,12 +198,24 @@ typedef struct {
     char error_message[256];
 } quic_tls_conn_t;
 
+// 功能：初始化 IPv4 地址结构。
+// 返回值：无。
 void quic_socket_addr_init_ipv4(quic_socket_addr_t *addr, uint8_t a, uint8_t b, uint8_t c, uint8_t d, uint16_t port);
+// 功能：比较两个 socket 地址是否完全相同。
+// 返回值：非 0 表示相同；0 表示不同。
 int quic_socket_addr_equal(const quic_socket_addr_t *lhs, const quic_socket_addr_t *rhs);
+// 功能：根据本地/对端 socket 地址初始化一个 path。
+// 返回值：无。
 void quic_path_addr_init(quic_path_addr_t *path, const quic_socket_addr_t *local, const quic_socket_addr_t *peer);
 
+// 功能：初始化 QUIC+TLS 连接对象。
+// 返回值：无。
 void quic_tls_conn_init(quic_tls_conn_t *conn);
+// 功能：释放 QUIC+TLS 连接对象持有的全部资源。
+// 返回值：无。
 void quic_tls_conn_free(quic_tls_conn_t *conn);
+// 功能：配置 QUIC 连接的角色、版本、CID 和服务端证书/私钥。
+// 返回值：0 表示成功；< 0 表示参数无效、TLS 初始化失败或版本不支持。
 int quic_tls_conn_configure(
     quic_tls_conn_t *conn,
     quic_role_t role,
@@ -213,40 +225,76 @@ int quic_tls_conn_configure(
     const char *cert_file,
     const char *key_file
 );
+// 功能：启动客户端握手或把连接推进到可收发状态。
+// 返回值：0 表示成功；< 0 表示连接未配置完成或启动失败。
 int quic_tls_conn_start(quic_tls_conn_t *conn);
+// 功能：在默认 path 上处理一个入站 datagram。
+// 返回值：0 表示成功；< 0 表示解包、密钥、状态机或 frame 处理失败。
 int quic_tls_conn_handle_datagram(quic_tls_conn_t *conn, const uint8_t *packet, size_t packet_len);
+// 功能：在显式 path 上处理一个入站 datagram。
+// 返回值：0 表示成功；< 0 表示 path 非法、解包失败或状态机拒绝。
 int quic_tls_conn_handle_datagram_on_path(quic_tls_conn_t *conn,
                                           const uint8_t *packet,
                                           size_t packet_len,
                                           const quic_path_addr_t *path);
+// 功能：在默认 path 上构造下一个待发送 datagram。
+// 返回值：0 表示成功；`QUIC_TLS_BUILD_BLOCKED` 表示暂时不能发；其他非零表示错误。
 int quic_tls_conn_build_next_datagram(quic_tls_conn_t *conn, uint8_t *out, size_t out_len, size_t *written);
+// 功能：构造下一个待发送 datagram，并返回其发送 path。
+// 返回值：0 表示成功；`QUIC_TLS_BUILD_BLOCKED` 表示暂时不能发；其他非零表示错误。
 int quic_tls_conn_build_next_datagram_on_path(quic_tls_conn_t *conn,
                                               uint8_t *out,
                                               size_t out_len,
                                               size_t *written,
                                               quic_path_addr_t *out_path);
+// 功能：判断连接当前是否仍有待发送输出。
+// 返回值：非 0 表示仍有待发送输出；0 表示没有。
 int quic_tls_conn_has_pending_output(const quic_tls_conn_t *conn);
+// 功能：仅推进 loss timeout 相关逻辑。
+// 返回值：无。
 void quic_tls_conn_on_loss_timeout(quic_tls_conn_t *conn, uint64_t now_ms);
+// 功能：查询当前 loss timeout 的截止时间。
+// 返回值：绝对时间毫秒值；0 表示当前没有 loss 定时器。
 uint64_t quic_tls_conn_loss_deadline_ms(const quic_tls_conn_t *conn);
+// 功能：推进统一超时入口，包括 loss、path validation 和 idle timeout。
+// 返回值：无。
 void quic_tls_conn_on_timeout(quic_tls_conn_t *conn, uint64_t now_ms);
+// 功能：查询下一次统一超时的截止时间。
+// 返回值：绝对时间毫秒值；0 表示当前没有定时器。
 uint64_t quic_tls_conn_next_timeout_ms(const quic_tls_conn_t *conn);
+// 功能：开启或关闭 Retry 逻辑。
+// 返回值：无。
 void quic_tls_conn_enable_retry(quic_tls_conn_t *conn, int enabled);
+// 功能：设置本端声明的最大 idle timeout。
+// 返回值：无。
 void quic_tls_conn_set_max_idle_timeout(quic_tls_conn_t *conn, uint64_t timeout_ms);
+// 功能：设置连接的初始 path。
+// 返回值：0 表示成功；< 0 表示 path 非法或状态不允许。
 int quic_tls_conn_set_initial_path(quic_tls_conn_t *conn, const quic_path_addr_t *path);
+// 功能：请求开始一次主动迁移或 preferred-address 迁移。
+// 返回值：0 表示成功；< 0 表示状态不允许、path 非法或迁移前提未满足。
 int quic_tls_conn_begin_migration(quic_tls_conn_t *conn, const quic_path_addr_t *path, int use_preferred_address);
+// 功能：在服务端连接上配置要通过 transport parameters 通告给客户端的 preferred address。
+// 返回值：0 表示成功；< 0 表示参数非法、CID/token 不合法或连接状态不允许。
 int quic_tls_conn_set_server_preferred_address(quic_tls_conn_t *conn,
                                                const quic_socket_addr_t *peer_addr,
                                                const quic_cid_t *cid,
                                                const uint8_t *stateless_reset_token);
+// 功能：读取对端通过 transport parameters 声明的 preferred address、CID 和 stateless reset token。
+// 返回值：0 表示成功；< 0 表示当前没有可用 preferred address、输出参数无效或信息尚未就绪。
 int quic_tls_conn_get_peer_preferred_address(const quic_tls_conn_t *conn,
                                              quic_path_addr_t *path,
                                              quic_cid_t *cid,
                                              uint8_t *stateless_reset_token);
+// 功能：根据收到的未知连接 datagram 构造一个 stateless reset 响应。
+// 返回值：0 表示成功；< 0 表示当前无法发送 stateless reset、输入长度非法或输出缓冲不足。
 int quic_tls_conn_build_stateless_reset(const quic_tls_conn_t *conn,
                                         size_t received_datagram_len,
                                         uint8_t *out,
                                         size_t out_len,
                                         size_t *written);
+// 功能：设置本端初始连接/流级流控额度，并同步到 transport parameters 与 stream map。
+// 返回值：无。
 void quic_tls_conn_set_initial_flow_control(quic_tls_conn_t *conn,
                                             uint64_t max_data,
                                             uint64_t max_stream_data_bidi_local,
@@ -254,28 +302,48 @@ void quic_tls_conn_set_initial_flow_control(quic_tls_conn_t *conn,
                                             uint64_t max_stream_data_uni,
                                             uint64_t max_streams_bidi,
                                             uint64_t max_streams_uni);
+// 功能：打开一个新的本地 stream。
+// 返回值：0 表示成功；< 0 表示 stream 数量限制、流控或状态不允许。
 int quic_tls_conn_open_stream(quic_tls_conn_t *conn, int bidirectional, uint64_t *stream_id);
+// 功能：向指定 stream 写入数据，并可选择带 FIN。
+// 返回值：0 表示成功；< 0 表示流不存在、流控受限或状态不允许。
 int quic_tls_conn_stream_write(quic_tls_conn_t *conn,
                                uint64_t stream_id,
                                const uint8_t *data,
                                size_t len,
                                int fin);
+// 功能：从指定 stream 读取数据。
+// 返回值：0 表示成功；< 0 表示流不存在、输出参数无效或状态不允许。
 int quic_tls_conn_stream_read(quic_tls_conn_t *conn,
                               uint64_t stream_id,
                               uint8_t *out,
                               size_t out_cap,
                               size_t *out_read,
                               int *out_fin);
+// 功能：查看指定 stream 当前可读字节数和 FIN 状态，但不消费数据。
+// 返回值：0 表示成功；< 0 表示流不存在或输出参数无效。
 int quic_tls_conn_stream_peek(const quic_tls_conn_t *conn,
                               uint64_t stream_id,
                               size_t *available,
                               int *fin,
                               int *exists);
+// 功能：向对端发送 STOP_SENDING 请求。
+// 返回值：0 表示成功；< 0 表示流不存在或当前状态不允许。
 int quic_tls_conn_stop_sending(quic_tls_conn_t *conn, uint64_t stream_id, uint64_t error_code);
+// 功能：向对端发送 RESET_STREAM。
+// 返回值：0 表示成功；< 0 表示流不存在或当前状态不允许。
 int quic_tls_conn_reset_stream(quic_tls_conn_t *conn, uint64_t stream_id, uint64_t error_code);
+// 功能：排队一个待发送的 PING。
+// 返回值：无。
 void quic_tls_conn_queue_ping(quic_tls_conn_t *conn);
+// 功能：请求发送 `CONNECTION_CLOSE`。
+// 返回值：0 表示成功；< 0 表示状态不允许或构包失败。
 int quic_tls_conn_close(quic_tls_conn_t *conn, uint64_t transport_error_code);
+// 功能：判断握手是否已经完成。
+// 返回值：非 0 表示已完成；0 表示未完成。
 int quic_tls_conn_handshake_complete(const quic_tls_conn_t *conn);
+// 功能：返回最近一次 TLS/QUIC 层错误文本。
+// 返回值：始终返回可读字符串。 
 const char *quic_tls_conn_last_error(const quic_tls_conn_t *conn);
 
 #endif // QUIC_TLS_H：头文件保护结束

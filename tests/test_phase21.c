@@ -224,13 +224,13 @@ static void configure_pair(quic_api_conn_t *client,
 }
 
 static int close_done(const quic_api_conn_t *client, const quic_api_conn_t *server) {
-    const quic_tls_conn_t *client_raw = quic_api_conn_raw(client);
-    const quic_tls_conn_t *server_raw = quic_api_conn_raw(server);
+    quic_api_conn_info_t client_info;
+    quic_api_conn_info_t server_info;
 
-    return client_raw &&
-           server_raw &&
-           (client_raw->conn.state == QUIC_CONN_STATE_DRAINING || client_raw->conn.state == QUIC_CONN_STATE_CLOSED) &&
-           (server_raw->conn.state == QUIC_CONN_STATE_DRAINING || server_raw->conn.state == QUIC_CONN_STATE_CLOSED);
+    return quic_api_conn_get_info(client, &client_info) == 0 &&
+           quic_api_conn_get_info(server, &server_info) == 0 &&
+           (client_info.state == QUIC_CONN_STATE_DRAINING || client_info.state == QUIC_CONN_STATE_CLOSED) &&
+           (server_info.state == QUIC_CONN_STATE_DRAINING || server_info.state == QUIC_CONN_STATE_CLOSED);
 }
 
 static void test_stage6_api_request_response_and_close(void) {
@@ -259,6 +259,9 @@ static void test_stage6_api_request_response_and_close(void) {
     int saw_server_open = 0;
     int saw_server_readable = 0;
     int saw_server_fin = 0;
+    quic_api_stream_info_t stream_info;
+    quic_api_conn_info_t client_info;
+    quic_api_conn_info_t server_info;
 
     make_path(&client_path, 1, 44330, 2, 44340);
     make_path(&server_path, 2, 44340, 1, 44330);
@@ -306,8 +309,27 @@ static void test_stage6_api_request_response_and_close(void) {
     assert(recvlen == sizeof(response4) - 1);
     assert(memcmp(recvbuf, response4, recvlen) == 0);
 
+    assert(quic_api_conn_get_stream_info(&client, stream0, &stream_info) == 0);
+    assert(stream_info.exists == 1);
+    assert(stream_info.fin_received == 1);
+    assert(stream_info.recv_final_size_known == 1);
+    assert(stream_info.recv_final_size == sizeof(response0) - 1);
+
+    assert(quic_api_conn_get_stream_info(&server, stream4, &stream_info) == 0);
+    assert(stream_info.exists == 1);
+    assert(stream_info.fin_received == 1);
+    assert(stream_info.recv_final_size_known == 1);
+    assert(stream_info.recv_final_size == sizeof(request4) - 1);
+
     assert(quic_api_conn_close(&client, QUIC_TRANSPORT_ERROR_NO_ERROR) == 0);
     run_until(&client, &server, close_done);
+
+    assert(quic_api_conn_get_info(&client, &client_info) == 0);
+    assert(quic_api_conn_get_info(&server, &server_info) == 0);
+    assert(client_info.handshake_complete == 1);
+    assert(server_info.handshake_complete == 1);
+    assert(client_info.path_count >= 1);
+    assert(server_info.path_count >= 1);
 
     assert(quic_api_conn_get_metrics(&client, &client_metrics) == 0);
     assert(quic_api_conn_get_metrics(&server, &server_metrics) == 0);

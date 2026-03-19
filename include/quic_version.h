@@ -17,11 +17,12 @@ typedef struct {
     uint8_t (*encode_packet_type)(uint8_t logical_type);
 } quic_version_ops_t;
 
-// 根据版本号获取对应的操作集；如果不支持该版本则返回 NULL
+// 功能：根据版本号获取对应的版本操作集。
+// 返回值：非 NULL 表示支持该版本；NULL 表示当前未实现该版本。
 const quic_version_ops_t* quic_version_get_ops(uint32_t version);
 
-// 生成版本协商（Version Negotiation）报文
-// 返回生成的报文总长度，如果出错返回 -1
+// 功能：根据入站长头元数据生成 Version Negotiation 报文。
+// 返回值：>= 0 表示生成的报文总长度；-1 表示输入非法或输出缓冲区不足。
 int quic_generate_version_negotiation(const quic_pkt_header_meta_t *in_meta, uint8_t *out_buf, size_t max_len);
 
 #endif // QUIC_VERSION_H：头文件保护结束

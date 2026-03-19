@@ -32,6 +32,7 @@ static void quic_api_sync_metrics(quic_api_conn_t *conn) {
         return;
     }
 
+    // metrics 对外暴露的是连接快照，因此每次观察事件后都从底层状态重新汇总。
     for (i = 0; i < QUIC_STREAM_MAX_COUNT; i++) {
         if (conn->tls.streams.streams[i].active) {
             active_streams++;
@@ -63,6 +64,7 @@ static void quic_api_push_event(quic_api_conn_t *conn,
         return;
     }
 
+    // 事件队列是固定环形缓冲区；溢出时丢弃最旧事件，但保留递增序号，方便调用方发现空洞。
     if (conn->event_count == QUIC_API_MAX_EVENTS) {
         conn->event_head = (conn->event_head + 1U) % QUIC_API_MAX_EVENTS;
         conn->event_count--;
@@ -112,6 +114,7 @@ static void quic_api_observe(quic_api_conn_t *conn) {
         return;
     }
 
+    // 这里把底层 quic_tls 的状态变化折叠成稳定 API 事件，避免应用层直接耦合内部结构字段。
     if (!conn->observed_handshake_complete && conn->tls.handshake_complete) {
         conn->observed_handshake_complete = 1;
         quic_api_push_event(conn,
@@ -175,6 +178,7 @@ static void quic_api_observe(quic_api_conn_t *conn) {
             continue;
         }
 
+        // readable 事件只在从“不可读”切到“可读”时触发，避免同一批缓冲数据被重复上报。
         if (available > 0) {
             if (!conn->observed_stream_readable[i]) {
                 quic_api_push_event(conn,
@@ -443,6 +447,49 @@ uint64_t quic_api_conn_next_timeout_ms(const quic_api_conn_t *conn) {
     return conn ? quic_tls_conn_next_timeout_ms(&conn->tls) : 0;
 }
 
+int quic_api_conn_get_info(const quic_api_conn_t *conn, quic_api_conn_info_t *out_info) {
+    if (!conn || !out_info) {
+        return -1;
+    }
+    memset(out_info, 0, sizeof(*out_info));
+    out_info->role = conn->tls.role;
+    out_info->state = conn->tls.conn.state;
+    out_info->handshake_complete = conn->tls.handshake_complete;
+    out_info->application_secrets_ready = conn->tls.application_secrets_ready;
+    out_info->has_pending_output = quic_api_conn_has_pending_output(conn) ? 1U : 0U;
+    out_info->close_received = conn->tls.close_received;
+    out_info->close_sent = conn->tls.close_sent;
+    out_info->stateless_reset_detected = conn->tls.stateless_reset_detected;
+    out_info->ping_received = conn->tls.ping_received;
+    out_info->path_count = conn->tls.path_count;
+    out_info->active_path_index = conn->tls.active_path_index;
+    out_info->pending_path_index = conn->tls.pending_path_index;
+    return 0;
+}
+
+int quic_api_conn_get_path_info(const quic_api_conn_t *conn, size_t path_index, quic_api_path_info_t *out_info) {
+    const quic_tls_path_t *path;
+
+    if (!conn || !out_info || path_index >= conn->tls.path_count) {
+        return -1;
+    }
+    memset(out_info, 0, sizeof(*out_info));
+    path = &conn->tls.paths[path_index];
+    out_info->present = path->active;
+    out_info->state = path->state;
+    out_info->local = path->addr.local;
+    out_info->peer = path->addr.peer;
+    out_info->bytes_received = path->bytes_received;
+    out_info->bytes_sent_before_validation = path->bytes_sent_before_validation;
+    out_info->challenge_pending = path->challenge_pending;
+    out_info->challenge_in_flight = path->challenge_in_flight;
+    out_info->challenge_expected = path->challenge_expected;
+    out_info->response_pending = path->response_pending;
+    out_info->response_in_flight = path->response_in_flight;
+    out_info->mtu_validated = path->mtu_validated;
+    return 0;
+}
+
 int quic_api_conn_open_stream(quic_api_conn_t *conn, int bidirectional, uint64_t *stream_id) {
     int rc;
 
@@ -501,6 +548,42 @@ int quic_api_conn_stream_peek(const quic_api_conn_t *conn,
         return -1;
     }
     return quic_tls_conn_stream_peek(&conn->tls, stream_id, available, fin, exists);
+}
+
+int quic_api_conn_get_stream_info(const quic_api_conn_t *conn, uint64_t stream_id, quic_api_stream_info_t *out_info) {
+    const quic_stream_t *stream;
+    size_t readable = 0;
+    int fin = 0;
+    int exists = 0;
+
+    if (!conn || !out_info) {
+        return -1;
+    }
+    memset(out_info, 0, sizeof(*out_info));
+    stream = quic_stream_map_find_const(&conn->tls.streams, stream_id);
+    if (!stream) {
+        return 0;
+    }
+    out_info->exists = 1;
+    out_info->local_initiated = stream->local_initiated;
+    out_info->bidirectional = stream->bidirectional;
+    out_info->send_open = stream->send_open;
+    out_info->recv_open = stream->recv_open;
+    out_info->fin_sent = stream->fin_sent;
+    out_info->fin_received = stream->fin_received;
+    out_info->reset_received = stream->reset_received;
+    out_info->stop_sending_received = stream->stop_sending_received;
+    out_info->send_highest_offset = stream->send_highest_offset;
+    out_info->recv_highest_offset = stream->recv_highest_offset;
+    out_info->recv_final_size_known = stream->recv_final_size_known;
+    out_info->recv_final_size = stream->recv_final_size;
+    if (quic_tls_conn_stream_peek(&conn->tls, stream_id, &readable, &fin, &exists) == 0 && exists) {
+        out_info->readable_bytes = readable;
+        if (fin) {
+            out_info->fin_received = 1;
+        }
+    }
+    return 0;
 }
 
 int quic_api_conn_stop_sending(quic_api_conn_t *conn, uint64_t stream_id, uint64_t error_code) {
@@ -667,6 +750,45 @@ int quic_api_event_format_json(const quic_api_event_t *event, char *out, size_t 
         memcpy(out, buffer, (size_t)written + 1U);
     }
 
+    return 0;
+}
+
+int quic_api_metrics_format_json(const quic_api_metrics_t *metrics, char *out, size_t out_cap) {
+    int written;
+
+    if (!metrics || !out || out_cap == 0) {
+        return -1;
+    }
+    written = snprintf(out,
+                       out_cap,
+                       "{\"bytes_sent\":%llu,\"bytes_received\":%llu,\"bytes_in_flight\":%llu,"
+                       "\"congestion_window\":%llu,\"latest_rtt_ms\":%llu,\"smoothed_rtt_ms\":%llu,"
+                       "\"pto_count\":%llu,\"events_emitted\":%llu,\"events_dropped\":%llu,"
+                       "\"streams_opened_local\":%llu,\"streams_opened_remote\":%llu,"
+                       "\"fin_streams_received\":%llu,\"connections_closed\":%llu,"
+                       "\"active_streams\":%zu,\"path_count\":%zu,\"active_path_index\":%zu}",
+                       (unsigned long long)metrics->bytes_sent,
+                       (unsigned long long)metrics->bytes_received,
+                       (unsigned long long)metrics->bytes_in_flight,
+                       (unsigned long long)metrics->congestion_window,
+                       (unsigned long long)metrics->latest_rtt_ms,
+                       (unsigned long long)metrics->smoothed_rtt_ms,
+                       (unsigned long long)metrics->pto_count,
+                       (unsigned long long)metrics->events_emitted,
+                       (unsigned long long)metrics->events_dropped,
+                       (unsigned long long)metrics->streams_opened_local,
+                       (unsigned long long)metrics->streams_opened_remote,
+                       (unsigned long long)metrics->fin_streams_received,
+                       (unsigned long long)metrics->connections_closed,
+                       metrics->active_streams,
+                       metrics->path_count,
+                       metrics->active_path_index);
+    if (written < 0 || (size_t)written >= out_cap) {
+        if (out_cap > 0) {
+            out[0] = '\0';
+        }
+        return -1;
+    }
     return 0;
 }
 

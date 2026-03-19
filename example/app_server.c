@@ -177,28 +177,32 @@ static int drain_stream(quic_api_conn_t *conn,
 }
 
 static void dump_conn_state(const quic_api_conn_t *conn) {
-    const quic_tls_conn_t *raw = quic_api_conn_raw(conn);
+    quic_api_conn_info_t info;
+    quic_api_path_info_t path;
     size_t i;
 
-    if (!raw) {
+    if (quic_api_conn_get_info(conn, &info) != 0) {
         return;
     }
     fprintf(stderr,
             "app-server-timeout state=%d handshake=%u active_path=%zu pending_path=%zu has_output=%d\n",
-            (int)raw->conn.state,
-            raw->handshake_complete,
-            raw->active_path_index,
-            raw->pending_path_index,
-            quic_api_conn_has_pending_output(conn));
-    for (i = 0; i < raw->path_count; i++) {
+            (int)info.state,
+            info.handshake_complete,
+            info.active_path_index,
+            info.pending_path_index,
+            info.has_pending_output);
+    for (i = 0; i < info.path_count; i++) {
+        if (quic_api_conn_get_path_info(conn, i, &path) != 0) {
+            continue;
+        }
         fprintf(stderr,
                 "  path[%zu] state=%u local_port=%u peer_port=%u challenge_in_flight=%u response_pending=%u\n",
                 i,
-                raw->paths[i].state,
-                raw->paths[i].addr.local.port,
-                raw->paths[i].addr.peer.port,
-                raw->paths[i].challenge_in_flight,
-                raw->paths[i].response_pending);
+                path.state,
+                path.local.port,
+                path.peer.port,
+                path.challenge_in_flight,
+                path.response_pending);
     }
 }
 
@@ -308,12 +312,12 @@ int main(int argc, char **argv) {
         int timeout_ms = 50;
         uint64_t next_deadline = quic_api_conn_next_timeout_ms(&conn);
         uint64_t now = now_ms();
-        const quic_tls_conn_t *raw = quic_api_conn_raw(&conn);
+        quic_api_conn_info_t info;
 
         if (responded0 &&
             responded4 &&
-            raw &&
-            (raw->conn.state == QUIC_CONN_STATE_DRAINING || raw->conn.state == QUIC_CONN_STATE_CLOSED)) {
+            quic_api_conn_get_info(&conn, &info) == 0 &&
+            (info.state == QUIC_CONN_STATE_DRAINING || info.state == QUIC_CONN_STATE_CLOSED)) {
             if (quic_api_conn_get_metrics(&conn, &metrics) == 0) {
                 printf("app server complete: responses=2 bytes_sent=%llu bytes_received=%llu cwnd=%llu rtt=%llu\n",
                        (unsigned long long)metrics.bytes_sent,

@@ -1,6 +1,6 @@
 # AI-QUIC
 
-`AI-QUIC` 是一个面向学习和分阶段实现的 QUIC 协议实验仓库。当前代码已经完成阶段 0、阶段 1、阶段 2 和阶段 3：除 QUIC v1/v2 的报文解析、Initial 密钥派生、Initial 报文保护/解保护、传输参数处理、最小化 ACK 与在途包管理外，还补上了基于 BoringSSL 的 TLS 1.3 QUIC 回调层、CRYPTO 数据重组、transport parameters 注入与解析、Handshake/0-RTT/1-RTT/短头包的真实收发、ACK 生成、Version Negotiation/Retry 运行时处理、服务端放大攻击限制，以及多流状态管理与基础流控。项目仍然不是完整的 QUIC 协议栈，更接近“协议构件验证平台”。
+`AI-QUIC` 是一个面向学习和分阶段实现的 QUIC 协议实验仓库。当前代码已经完成阶段 0、阶段 1、阶段 2、阶段 3 和阶段 4，并已落地阶段 5 的核心连接管理/迁移路径与阶段 6 子阶段 A 的应用接口层：除 QUIC v1/v2 的报文解析、Initial 密钥派生、Initial 报文保护/解保护、传输参数处理、最小化 ACK 与在途包管理外，还补上了基于 BoringSSL 的 TLS 1.3 QUIC 回调层、CRYPTO 数据重组、transport parameters 注入与解析、Handshake/0-RTT/1-RTT/短头包的真实收发、ACK 生成、Version Negotiation/Retry 运行时处理、服务端放大攻击限制、多流状态管理与基础流控、RFC 9002 恢复/拥塞控制主体，以及面向应用的 `quic_api` 与 qlog/metrics 基础观测。项目仍然不是完整的 QUIC 协议栈，但已经从“协议构件验证平台”推进到“具备阶段化真实验证能力的 QUIC 实验栈”。
 
 ## 参考标准
 
@@ -21,6 +21,8 @@
 - `src/frame/`: 帧级别的通用语法解析
 - `src/recovery/`: ACK 解析与最小在途包管理
 - `src/transport/`: UDP 批量接收、连接骨架、CRYPTO 缓冲与流状态管理
+- `src/app/`: 面向应用层的稳定接口与观测封装
+- `API.md`: 面向应用层使用者的对外 API 文档
 - `example/`: 基于 UDP 的最小 QUIC server/client 示例
 - `tests/`: 分阶段测试
 
@@ -37,6 +39,9 @@
 7. 在阶段 1 中接入 BoringSSL 的 `SSL_QUIC_METHOD`，实现 CRYPTO 数据重组、transport parameters 注入/解析、Handshake 与 1-RTT 密钥安装、握手 flight 定时重传，以及最小化的短头包 PING 验证路径。
 8. 在阶段 2 中补齐最小可运行的包收发管线：Initial、Handshake、0-RTT、1-RTT、短头包的解析与构造，ACK 自动生成，Version Negotiation 与 Retry 串接，服务端放大攻击限制，以及真实 UDP 示例上的 1-RTT 加密收发。
 9. 在阶段 3 中补齐 stream 状态机、发送缓冲、接收重组、FIN/RESET/STOP_SENDING、MAX_DATA/MAX_STREAM_DATA/MAX_STREAMS enforcement，以及基本多流调度器；当前 `example/` 已能在两个双向流上完成双向数据交换。
+10. 在阶段 4 中补齐 RFC 9002 的恢复与拥塞控制主体：sent-packet metadata、RTT 估计、ACK delay、loss detection、PTO、拥塞窗口、persistent congestion，以及 congestion-limited / flow-control-limited / application-limited 的区分验证。
+11. 在阶段 5 中补齐连接管理与迁移核心路径：CID/token 基础状态机、idle timeout、closing/draining、stateless reset、path validation、preferred-address 迁移，以及对应的真实网络验证入口。
+12. 在阶段 6 子阶段 A 中补上一层稳定的 `quic_api`，并增加 qlog 风格事件、基础 metrics、app demo 和面向应用的 loopback/topology 自测入口。
 
 ## 功能审计结果
 
@@ -65,8 +70,10 @@
 | TLS 1.3 QUIC 握手核心 | BoringSSL QUIC 回调、CRYPTO 重组、transport parameters 注入/解析、Handshake/1-RTT 密钥安装与旧密钥丢弃 | RFC 9001 | `src/tls/quic_tls.c`, `src/transport/quic_crypto_stream.c` | `tests/test_phase12.c` |
 | 阶段 2 包收发管线 | Handshake、0-RTT、1-RTT、短头包的解析/构造，ACK 生成，Version Negotiation，Retry，服务端放大攻击限制 | RFC 9000, RFC 9001, RFC 9002, RFC 9369 | `src/tls/quic_tls.c`, `src/packet/quic_version.c`, `src/packet/quic_retry.c` | `tests/test_phase13.c` |
 | 阶段 3 流与流控基础 | stream 状态机、发送缓冲、接收重组、FIN/RESET/STOP_SENDING、MAX_DATA/MAX_STREAM_DATA/MAX_STREAMS enforcement、基本调度器 | RFC 9000 | `src/transport/quic_stream.c`, `src/tls/quic_tls.c` | `tests/test_phase14.c` |
+| 阶段 4 恢复与拥塞控制主体 | sent-packet metadata、RTT 估计、ACK delay、packet-threshold / time-threshold loss detection、PTO、拥塞窗口、persistent congestion、application-limited / flow-control-limited 区分 | RFC 9002 | `include/quic_recovery.h`, `src/recovery/loss_detector.c`, `src/tls/quic_tls.c` | `tests/test_phase15.c`, `tests/test_phase16.c`, `tests/test_phase17.c`, `make topo-stage4-clean`, `make topo-stage4-lossy` |
+| 阶段 5 连接管理与迁移核心路径 | `NEW_CONNECTION_ID` / `RETIRE_CONNECTION_ID` 基础语义、token、idle timeout、closing/draining、stateless reset、`PATH_CHALLENGE` / `PATH_RESPONSE`、`preferred_address` 迁移基础路径 | RFC 9000 | `src/tls/quic_tls.c`, `example/client.c`, `example/server.c`, `topo.py` | `tests/test_phase18.c`, `tests/test_phase19.c`, `tests/test_phase20.c`, `make topo-stage5-preferred` |
 | 最小端到端多流示例 | UDP server/client 建立加密 QUIC 连接、在两个 bidirectional stream 上双向收发应用数据，并交换 1-RTT PING | RFC 9000, RFC 9001 | `example/server.c`, `example/client.c`, `topo.py` | `tests/test_phase12.c`, `tests/test_phase13.c`, `tests/test_phase14.c`, `make quic-demo` |
-| 阶段 6 子阶段 A 应用接口与观测 | 稳定 `quic_api`、qlog 风格事件、基础 metrics、双 stream app demo、阶段 6 自测入口 | RFC 9000, RFC 9001, RFC 9002 | `include/quic_api.h`, `src/app/quic_api.c`, `example/app_client.c`, `example/app_server.c`, `topo.py` | `tests/test_phase21.c`, `tests/test_phase22.c`, `tests/test_phase23.c`, `make quic-app-demo` |
+| 阶段 6 子阶段 A 应用接口与观测 | 稳定 `quic_api`、根目录 `API.md`、qlog 风格事件、基础 metrics、连接/路径/流快照、双 stream app demo、独立 fuzz smoke 入口 | RFC 9000, RFC 9001, RFC 9002 | `include/quic_api.h`, `src/app/quic_api.c`, `API.md`, `example/app_client.c`, `example/app_server.c`, `tests/fuzz/quic_fuzz_smoke.c`, `topo.py` | `tests/test_phase21.c`, `tests/test_phase22.c`, `tests/test_phase23.c`, `make fuzz-smoke`, `make quic-app-demo` |
 
 ### 部分实现功能
 
@@ -77,18 +84,20 @@
 - 传输参数虽然支持编解码多个标准字段，但缺少默认值补齐、语义合法性校验和跨字段约束检查。
 - Version Negotiation 与 Retry 已串进真实收发流程，但仍缺少降级防护、兼容版本协商和更完整的 token/地址验证策略。
 - 0-RTT 已具备包级解析/构造路径，但仍未接入真实应用数据、重放风险约束和会话票据语义。
-- ACK/恢复模块只实现了最小 in-flight bookkeeping；虽然连接层已有统一定时器入口，但尚未实现 RTT 估计、丢包检测、PTO 或拥塞控制。
+- 恢复/拥塞控制主体已经落地，但 ECN 发送标记、ACK_ECN 驱动的完整路径验证和更细的 benchmark/公平性对比仍未完成。
+- 阶段 5 已实现单连接范围内的 CID、path validation、`preferred_address` 和关闭路径基础语义，但尚未完成跨实现互通下的系统性验证。
+- 阶段 6 当前已完成“稳定 API + 基础观测 + app demo + fuzz smoke”这一层；外部 interop、libFuzzer/sanitizer 级 fuzzing 和 HTTP/3/QPACK 仍未接入。
 
 ### 尚未实现功能
 
-与 RFC 9000/9001/9002/9369 相比，当前仓库明显缺失以下核心能力：
+与 RFC 9000/9001/9002/9369 以及阶段 6 的目标相比，当前仓库仍明显缺失以下核心能力：
 
-- 连接迁移、路径验证、CID 生命周期管理与 NEW_CONNECTION_ID 语义执行
-- Stateless Reset 构造与处理
-- 丢包检测、RTT 估计、PTO、NewReno 拥塞控制等 RFC 9002 主体逻辑
+- 外部实现 interop 自动化（当前只完成对象筛选与本仓库内部准备，尚未接入 `xquic` / `quic-interop-runner`）
+- 更系统的 benchmark 体系（当前 `topo.py` 仍以本仓库 profile 为主，尚未接入 `quic-network-simulator`）
+- HTTP/3 / QPACK 集成与对应测试
 - 密钥更新（Key Update）与更完整的密钥生命周期管理
+- 完整 0-RTT / resumption / ticket 语义
 - ECN 路径验证与拥塞反馈处理
-- 应用层协议（例如 HTTP/3）集成
 
 ## 测试说明
 
@@ -108,9 +117,16 @@
 - `test12`: 阶段 1 TLS/QUIC 握手核心，覆盖 CRYPTO 重组、transport parameters、Handshake/1-RTT 密钥安装、旧密钥丢弃与内存内端到端握手
 - `test13`: 阶段 2 完整包收发管线，覆盖 ACK 生成、交错时序下的后续 Initial、Retry、Version Negotiation、放大攻击限制、0-RTT 与短头包路径
 - `test14`: 阶段 3 流与流控基础，覆盖多流双向数据传输、MAX_DATA/MAX_STREAM_DATA 增长，以及 STOP_SENDING 触发 RESET_STREAM
+- `test15`: 阶段 4 恢复状态机，覆盖 RTT 采样、ACK delay、loss detection、PTO 与包号空间清理
+- `test16`: 阶段 4 拥塞控制与流控/应用受限交互，覆盖 slow start、窗口收缩与受限状态区分
+- `test17`: 阶段 4 bulk 传输与阻塞回归，覆盖内存内长流、大文件与 `BUILD_BLOCKED`/恢复行为
+- `test18`: 阶段 5 CID / token / termination 状态机，覆盖 `NEW_CONNECTION_ID`、idle timeout、closing/draining 与 stateless reset
+- `test19`: 阶段 5 path validation / migration 状态机，覆盖 `PATH_CHALLENGE` / `PATH_RESPONSE`、rebind 和 `preferred_address`
+- `test20`: 阶段 5 真实网络迁移入口，覆盖 `preferred_address` 迁移后的文件传输与关闭路径
 - `test21`: 阶段 6 应用 API 与关闭语义，覆盖稳定应用接口、双 stream 请求/响应和优雅关闭
 - `test22`: 阶段 6 qlog/metrics 与准 fuzz 回归，覆盖事件导出、基础指标采样和包头解析压力回归
 - `test23`: 阶段 6 app demo 本机 loopback，覆盖 `quic_app_server/quic_app_client`、qlog 文件落盘和真实 UDP 请求/响应
+- `fuzz-smoke`: 阶段 6 独立 fuzz smoke harness，覆盖包头解析、frame 解析、transport parameters、ACK range 与 stream 状态机
 
 运行方式：
 
@@ -129,6 +145,16 @@ make test11
 make test12
 make test13
 make test14
+make test15
+make test16
+make test17
+make test18
+make test19
+make test20
+make test21
+make test22
+make test23
+make fuzz-smoke
 ```
 
 或直接编译全部当前测试目标：
@@ -171,6 +197,14 @@ make topo-stage4-clean
 make topo-stage4-lossy
 ```
 
+如果要按阶段 5 / 阶段 6 的当前入口继续验证，可以运行：
+
+```bash
+make topo-stage5-preferred
+make topo-stage6-clean
+make topo-stage6-lossy
+```
+
 也可以直接覆盖链路参数：
 
 ```bash
@@ -185,9 +219,15 @@ sudo python3 topo.py --auto-file --profile lossy-recovery --bw 100 --delay 20 --
 - `server_source.bin`: 服务端下发源文件
 - `client_downloaded.bin`: 客户端下载后的文件
 
+当前测试维护原则：
+
+- 现有分阶段测试、本机回环和 `topo.py`/`Makefile` 入口都必须保留，不能为了接新阶段而替换掉已经稳定的旧验证链路。
+- 新测试应优先增量接入现有三层链路：单元/阶段测试 -> 本机 loopback -> 真实拓扑。
+- 如果新的网络验证会明显扰动当前稳定的 `topo.py` profile，优先新开独立的 `topo_*.py` 或阶段专用拓扑脚本，而不是破坏已有 stage4/stage5/stage6 入口。
+
 ## 当前定位
 
-如果你的目标是“完整 QUIC 协议栈”，这个仓库仍处于早期构件验证阶段；如果你的目标是“逐模块验证 QUIC 关键部件并继续演进”，当前结构已经适合作为后续扩展的基础。
+如果你的目标是“完整 QUIC 协议栈”，这个仓库目前处于“核心 transport/recovery 已成形、连接管理与应用接口已落地、外部互通与 HTTP/3 尚待补齐”的中后段阶段；如果你的目标是“逐模块验证 QUIC 关键部件并继续演进”，当前结构已经具备持续扩展与分层验证的基础。
 
 基于 README.md 里的缺失项，这个仓库要补成“完整 QUIC 协议栈”，建议按依赖关系分 7 个阶段推进，而不是按 RFC 章节平铺开发。核心顺序应当是：先把连接模型和密钥生命周期搭稳，再补完整收发管线，再做流控/恢复，最后上迁移和应用层。
 
@@ -344,7 +384,7 @@ sudo python3 topo.py --auto-file --profile lossy-recovery --bw 100 --delay 20 --
 - `topo.py` 当前已经支持 `--profile`、`--bw`、`--delay`、`--loss`；`--queue`、`--ecn` 仍是后续增强项。
 - `example/client.c` / `example/server.c` 当前的文件传输模式已可用于 stage4 bulk 验证；更复杂的持续流量模式仍可作为后续增强项。
 
-阶段 5：实现连接管理与迁移能力。补齐 CID 生命周期、NEW_CONNECTION_ID/RETIRE_CONNECTION_ID 语义、path validation、connection migration、preferred_address、stateless reset、idle timeout、close/error handling、token 与地址验证。完成标志是连接不仅能“建立和传数据”，还能正确处理迁移、关闭和异常路径。
+阶段 5：核心连接管理与迁移路径已落地，当前保留 `tests/test_phase18.c`、`tests/test_phase19.c`、`tests/test_phase20.c` 与 `make topo-stage5-preferred` 作为回归入口。已实现 CID/token 基础状态机、path validation、`preferred_address` 迁移、idle timeout、closing/draining 与 stateless reset 基础路径；更广泛的跨实现互通和 benchmark 收尾留给阶段 6。
 
 #### 阶段 5 设计细化
 
@@ -527,20 +567,118 @@ sudo python3 topo.py --auto-file --profile lossy-recovery --bw 100 --delay 20 --
 
 - 已落地：
   - `include/quic_api.h` / `src/app/quic_api.c`：稳定应用接口，封装连接创建、收发、stream 读写、timeout 驱动、迁移入口和 close 入口
+  - 根目录 `API.md`：对外 API 用法、数据结构、事件/metrics 和示例说明
   - qlog 风格事件队列与 JSON 导出
-  - 基础 metrics 导出：收发字节、拥塞窗口、在途字节、PTO 计数、活跃 stream/path 数
+  - 基础 metrics 导出：收发字节、拥塞窗口、在途字节、PTO 计数、活跃 stream/path 数，以及 JSON 导出
+  - 连接/路径/流快照接口，避免应用层直接依赖内部 `quic_tls` 结构
   - `example/app_client.c` / `example/app_server.c`：基于 `quic_api` 的最小双 stream 请求/响应 demo
   - `tests/test_phase21.c` / `tests/test_phase22.c` / `tests/test_phase23.c`
+  - `tests/fuzz/quic_fuzz_smoke.c` 与 `make fuzz-smoke`
   - `topo.py` 的 `app-demo-clean` / `app-demo-lossy` profile，以及 `make topo-stage6-clean` / `make topo-stage6-lossy`
 - 已验证：
   - `make test21 test22`
+  - `make fuzz-smoke`
   - `make test23`
   - `make TEST_REPEAT=1 test18 test19 test20`
   - `python3 -m py_compile topo.py`
 - 尚未完成：
-  - 外部实现 interop（`quiche` / `ngtcp2` / `msquic`）
+  - 外部实现 interop（当前优先对象已收敛为 `xquic`，但尚未真正接入）
   - HTTP/3 / QPACK
-  - 更系统的 fuzz harness（当前只有准 fuzz 回归，不是 libFuzzer 级别）
+  - 更系统的 fuzz harness（当前已有 smoke harness，但还不是 libFuzzer / sanitizer 级别）
+
+##### 阶段 6 下半部分：调研结论与对象选择
+
+这一轮先不写实现代码，先确定 interop 对象和 benchmark 基线。当前推荐结论如下：
+
+- interop 首选对象：`xquic`
+- benchmark 首选框架：`quic-network-simulator`
+- correctness 框架：`quic-interop-runner`
+- `h2load` 暂不作为当前主 benchmark，只在后续 HTTP/3 子阶段再引入
+
+选择 `xquic` 的原因：
+
+- `xquic` 官方仓库明确声明自己是 QUIC 与 HTTP/3 的 client/server 实现，并且“regularly tested with other QUIC implementations”。
+- `xquic` 官方文档已经给出 `test_client` / `test_server` 的直接运行方式，适合作为本仓库下半阶段的第一个外部互通对象。
+- `xquic` 仓库本身包含 `interop/` 目录，且其官方文档列出 `qlog`、拥塞控制、迁移等特性，说明它不仅能作为“能握手的对象”，也适合作为后续迁移与可观测性比对对象。
+- 从工程形态看，`xquic` 与本仓库同为 C 语言、同样使用 BoringSSL 路线，接入成本和日志对比成本都低于 Go/Rust/C# 实现。
+
+当前建议的 interop 分阶段顺序：
+
+1. 先做本机 loopback 的双实现 smoke test：
+   - 我方 client -> xquic server
+   - xquic client -> 我方 server
+2. 再接 `quic-interop-runner`，优先只启用与当前实现边界匹配的 case：
+   - `handshake`
+   - `transfer`
+   - `retry`
+   - `rebind-port`
+   - `rebind-addr`
+   - `connectionmigration`
+3. 等这些 case 稳定后，再扩大到：
+   - `multiconnect`
+   - `transferloss`
+   - `handshakeloss`
+4. 当前暂缓的 case：
+   - `http3`
+   - `zerortt`
+   - `resumption`
+   - `keyupdate`
+   - `v2`
+   - `chacha20`
+
+这些暂缓项不是说不做，而是它们依赖本仓库当前尚未完成的 HTTP/3、完整 0-RTT/恢复票据、Key Update 或更细的版本/密码套件覆盖，不适合作为下半阶段第一批 interop 目标。
+
+benchmark 选择结论：
+
+- 当前阶段不建议把 `h2load` 作为主 benchmark。
+  原因是 `h2load` 的强项是 HTTP/3 / HTTP/2 / HTTP/1.1 压测；而本仓库当前尚未实现 HTTP/3，因此现在引入它会把“应用层协议未完成”和“QUIC transport 性能”混在一起。
+- 当前阶段更合适的 benchmark 是 `quic-network-simulator`。
+  它是 QUIC 社区官方维护的 ns-3 网络模拟框架，目标就是“benchmarking and measuring the performance of QUIC implementations under various network conditions”，并且天然适合和 `quic-interop-runner` 的 Docker endpoint 形态复用。
+- `quic-interop-runner` 本身则承担 correctness 与 feature coverage，不应替代 benchmark；但它的公开运行结果已经把 `goodput`、`crosstraffic`、`blackhole` 等 measurement case 暴露出来，因此下半阶段完全可以采用“interop-runner 跑协议正确性，network-simulator 跑性能场景”的二层结构。
+
+benchmark 基线建议如下：
+
+- 基准对象：
+  - 我方实现 vs `xquic`
+- 指标：
+  - handshake completion time
+  - transfer completion time
+  - goodput
+  - bytes in flight / cwnd 演化
+  - PTO 次数
+  - 丢包恢复后的完成时延
+  - qlog / pcap 可用性
+- 第一批场景：
+  - `simple-p2p --delay=15ms --bandwidth=10Mbps --queue=25`
+  - `simple-p2p --delay=60ms --bandwidth=20Mbps --queue=50`
+  - `simple-p2p --delay=20ms --bandwidth=10Mbps --queue=25` 并叠加轻度丢包
+  - `single-tcp` cross traffic 场景，用于观察 goodput 与恢复行为
+
+候选 benchmark / 测试框架筛选：
+
+- `quic-network-simulator`：选作当前主 benchmark。
+  - 适配原因：官方定位就是 QUIC benchmark，能系统控制时延、带宽、队列、交叉流量，比当前 `topo.py` 更接近阶段 6 下半部分需要的长期基线。
+  - 适用范围：transport 层性能、拥塞控制、恢复行为、跨实现 goodput 对比。
+- `quic-interop-runner`：选作 correctness / feature coverage 框架，不单独承担 benchmark 角色。
+  - 适配原因：官方已经定义 `handshake`、`transfer`、`retry`、`rebind-port`、`rebind-addr`、`connectionmigration` 等 test case，并且能保存日志、pcap、`SSLKEYLOGFILE` 与 `QLOGDIR`。
+  - 适用范围：外部互通、回归矩阵、功能边界验证。
+- `h2load`：暂缓。
+  - 不选当前主 benchmark 的原因：它本质上是 HTTP/3 / HTTP/2 / HTTP/1.1 压测工具；本仓库当前还没有 HTTP/3，因此现在用它会把 transport 问题和应用层协议实现缺口混在一起。
+  - 后续位置：等 HTTP/3 子阶段落地后，再把它接入 stage 6 的后半部分。
+
+interop 对象筛选：
+
+- 第一优先级：`xquic`
+  - 选择理由：同为 C 语言、BoringSSL 路线、官方文档直接提供 `test_client` / `test_server`、并且官方明确说明会定期做 interoperability testing，接入成本最低。
+- 第二梯队候选：`ngtcp2`、`quiche`、`msquic`
+  - 保留原因：它们适合补充跨语言 / 跨工程风格的覆盖面。
+  - 暂不作为第一目标：和当前仓库在构建系统、依赖模型、日志习惯上的差异更大，早期接入会放大环境问题而不是优先验证 transport/迁移实现。
+
+筛选结论总结：
+
+- 现在就应该引入：`xquic`、`quic-interop-runner`、`quic-network-simulator`
+- 暂缓到 HTTP/3 子阶段：`h2load`
+- 不选作当前主 benchmark：只面向特定实现的 QUIC 压测工具
 
 #### 阶段 6 设计细化
 
@@ -687,5 +825,6 @@ sudo python3 topo.py --auto-file --profile lossy-recovery --bw 100 --delay 20 --
   - `--transfer-size`
   - `--request-count`
   - `--enable-qlog`
+- 现有 `topo.py` 的 stage4/stage5/stage6 profile 需要继续保留；如果 interop 或 benchmark 需要更重的网络编排，应优先新增独立 topo 脚本，而不是覆写已稳定的入口。
 - `example/` 不应只输出一句“成功/失败”，而要在失败时给出对应用层和 transport 层都有帮助的高信号状态。
 - 阶段 6 完成前，README 中“已完成能力”不应提前宣称“HTTP/3 已实现”或“已完成全面互操作”；只有 `test_phase21/22/23` 与对应 `topo.py` profile、至少一种外部实现的互通验证稳定通过后，才能把这一阶段标记为完成。

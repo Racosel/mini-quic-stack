@@ -121,25 +121,39 @@ typedef struct {
     size_t last_acked_packets;
 } quic_connection_t;
 
+// 功能：初始化 QUIC 连接骨架和各个包号空间。
+// 返回值：无。
 void quic_conn_init(quic_connection_t *conn);
+// 功能：为指定包号空间安装接收密钥。
+// 返回值：0 表示成功；< 0 表示参数无效或状态不允许。
 int quic_conn_install_rx_keys(
     quic_connection_t *conn,
     quic_pn_space_id_t space_id,
     const quic_crypto_level_ctx_t *rx_ctx
 );
+// 功能：为指定包号空间安装发送密钥。
+// 返回值：0 表示成功；< 0 表示参数无效或状态不允许。
 int quic_conn_install_tx_keys(
     quic_connection_t *conn,
     quic_pn_space_id_t space_id,
     const quic_crypto_level_ctx_t *tx_ctx
 );
+// 功能：一次性为指定包号空间安装收发密钥。
+// 返回值：0 表示成功；< 0 表示参数无效或状态不允许。
 int quic_conn_install_space_keys(
     quic_connection_t *conn,
     quic_pn_space_id_t space_id,
     const quic_crypto_level_ctx_t *rx_ctx,
     const quic_crypto_level_ctx_t *tx_ctx
 );
+// 功能：丢弃指定包号空间的密钥和恢复状态。
+// 返回值：无。
 void quic_conn_discard_space(quic_connection_t *conn, quic_pn_space_id_t space_id);
+// 功能：根据版本和 ODCID 初始化 Initial 包号空间密钥。
+// 返回值：0 表示成功；< 0 表示版本不支持、参数非法或密钥派生失败。
 int quic_conn_set_initial_keys(quic_connection_t *conn, uint32_t version, const quic_cid_t *original_dcid);
+// 功能：为指定包号空间生成一次发送计划。
+// 返回值：0 表示成功；< 0 表示状态不允许、密钥未就绪或参数无效。
 int quic_conn_prepare_send(
     quic_connection_t *conn,
     quic_pn_space_id_t space_id,
@@ -147,11 +161,23 @@ int quic_conn_prepare_send(
     uint8_t ack_eliciting,
     quic_conn_tx_plan_t *out_plan
 );
+// 功能：按统一入口接收一个 QUIC 数据包并分发到对应包号空间。
+// 返回值：0 表示成功；< 0 表示解包、状态机或密钥处理失败。
 int quic_conn_recv_packet(quic_connection_t *conn, uint8_t *packet, size_t packet_len);
+// 功能：走兼容入口仅接收并处理 Initial 包。
+// 返回值：0 表示成功；< 0 表示 Initial 包解析或处理失败。
 int quic_conn_recv_initial(quic_connection_t *conn, uint8_t *packet, size_t packet_len);
+// 功能：为指定连接定时器设置触发截止时间。
+// 返回值：无。
 void quic_conn_arm_timer(quic_connection_t *conn, quic_conn_timer_id_t timer_id, uint64_t deadline_ms);
+// 功能：取消指定连接定时器。
+// 返回值：无。
 void quic_conn_disarm_timer(quic_connection_t *conn, quic_conn_timer_id_t timer_id);
+// 功能：处理某个连接定时器的超时事件。
+// 返回值：0 表示成功；< 0 表示状态非法或参数无效。
 int quic_conn_on_timer(quic_connection_t *conn, quic_conn_timer_id_t timer_id, uint64_t now_ms);
+// 功能：统一处理连接事件入口，包括收包、发包准备和定时器。
+// 返回值：0 表示成功；< 0 表示事件处理失败或参数无效。
 int quic_conn_handle_event(
     quic_connection_t *conn,
     const quic_conn_event_t *event,

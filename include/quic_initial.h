@@ -15,6 +15,8 @@ typedef struct {
     size_t pn_offset;
 } quic_initial_header_t;
 
+// 功能：解析 QUIC Initial 长头中的 token、length 与包号偏移。
+// 返回值：0 表示成功；< 0 表示报文格式不合法、字段缺失或长度不足。
 int quic_parse_initial_header(const uint8_t *packet, size_t packet_len, quic_initial_header_t *out);
 
 #endif // QUIC_INITIAL_H：头文件保护结束

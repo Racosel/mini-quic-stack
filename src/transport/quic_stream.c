@@ -129,6 +129,7 @@ static int quic_stream_add_retransmit_range(quic_stream_t *stream, uint64_t star
         merge_end++;
     }
 
+    // 重传区间始终保持有序且尽量合并，避免同一段 STREAM 数据被拆成过多片段反复调度。
     if (merge_end == insert_at && count == QUIC_STREAM_MAX_RETRANSMIT_RANGES) {
         return -1;
     }
@@ -343,6 +344,7 @@ static int quic_stream_maybe_raise_max_stream_data(quic_stream_t *stream) {
         return 0;
     }
 
+    // 当消费进度超过窗口一半时再增发额度，减少 MAX_STREAM_DATA 控制帧的发送频率。
     stream->recv_max_data = new_limit;
     stream->max_stream_data_to_send = new_limit;
     stream->max_stream_data_pending = 1;
@@ -733,6 +735,7 @@ int quic_stream_map_on_stream(quic_stream_map_t *map,
         quic_stream_set_error(err, err_len, "failed to buffer stream data");
         return -1;
     }
+    // 连接级流控只为新的最高偏移记账；重复包和乱序重传不会重复占用额度。
     if (delta > 0) {
         stream->recv_highest_offset = end_offset;
         map->recv_connection_highest += delta;
@@ -871,6 +874,7 @@ int quic_stream_map_has_pending_output(const quic_stream_map_t *map) {
         return 1;
     }
 
+    // 这里只回答“是否值得继续构包”，因此只看控制帧、重传和真正可发送的 STREAM 数据。
     for (i = 0; i < QUIC_STREAM_MAX_COUNT; i++) {
         const quic_stream_t *stream = &map->streams[i];
 

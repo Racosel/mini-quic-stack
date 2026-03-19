@@ -103,10 +103,20 @@ typedef struct {
 
 typedef void (*quic_recovery_packet_observer_t)(void *ctx, const quic_sent_packet_t *packet);
 
+// 功能：初始化 in-flight 队列。
+// 返回值：无。
 void quic_queue_init(quic_in_flight_queue_t *q);
+// 功能：清空 in-flight 队列并释放已记录的发送包节点。
+// 返回值：无。
 void quic_queue_clear(quic_in_flight_queue_t *q);
+// 功能：以最小元数据形式记录一个已发送包。
+// 返回值：无。
 void quic_on_packet_sent(quic_in_flight_queue_t *q, uint64_t pn, size_t len, int ack_eliciting);
+// 功能：把一个包号标记为已确认，并从队列中移除。
+// 返回值：无。
 void quic_on_packet_acked(quic_in_flight_queue_t *q, uint64_t pn);
+// 功能：以完整恢复元数据形式记录一个已发送包。
+// 返回值：无。
 void quic_on_packet_sent_ex(quic_in_flight_queue_t *q,
                             uint64_t pn,
                             size_t len,
@@ -119,13 +129,27 @@ void quic_on_packet_sent_ex(quic_in_flight_queue_t *q,
                             int flow_control_limited,
                             uint64_t now_ms,
                             const quic_sent_packet_meta_t *meta);
+// 功能：返回当前队列里最老的未确认包。
+// 返回值：非 NULL 表示存在未确认包；NULL 表示队列为空。
 const quic_sent_packet_t *quic_recovery_oldest_unacked(const quic_in_flight_queue_t *q);
 
+// 功能：初始化 RFC 9002 恢复状态。
+// 返回值：无。
 void quic_recovery_init(quic_recovery_state_t *state, uint64_t max_datagram_size);
+// 功能：设置对端通告的 `max_ack_delay`。
+// 返回值：无。
 void quic_recovery_set_max_ack_delay(quic_recovery_state_t *state, uint64_t max_ack_delay_ms);
+// 功能：标记握手是否已经确认。
+// 返回值：无。
 void quic_recovery_set_handshake_confirmed(quic_recovery_state_t *state, int confirmed);
+// 功能：标记对端是否已完成地址验证。
+// 返回值：无。
 void quic_recovery_set_peer_completed_address_validation(quic_recovery_state_t *state, int validated);
+// 功能：判断当前恢复/拥塞控制状态是否允许继续发送指定字节数。
+// 返回值：非 0 表示允许发送；0 表示当前不允许。
 int quic_recovery_can_send(const quic_recovery_state_t *state, size_t sent_bytes);
+// 功能：把一个新发送的包登记到恢复状态和 in-flight 队列。
+// 返回值：无。
 void quic_recovery_on_packet_sent(quic_recovery_state_t *state,
                                   quic_in_flight_queue_t *q,
                                   uint64_t pn,
@@ -139,6 +163,8 @@ void quic_recovery_on_packet_sent(quic_recovery_state_t *state,
                                   int flow_control_limited,
                                   uint64_t now_ms,
                                   const quic_sent_packet_meta_t *meta);
+// 功能：在收到 ACK 后更新 RTT、拥塞窗口和丢包判定。
+// 返回值：0 表示成功；< 0 表示 ACK 输入非法或内部状态异常。
 int quic_recovery_on_ack_received(quic_recovery_state_t *state,
                                   quic_in_flight_queue_t *q,
                                   const void *ack_frame,
@@ -150,12 +176,16 @@ int quic_recovery_on_ack_received(quic_recovery_state_t *state,
                                   void *observer_ctx,
                                   size_t *acked_packets,
                                   size_t *lost_packets);
+// 功能：计算当前应使用的恢复定时器模式和截止时间。
+// 返回值：0 表示成功；< 0 表示输入参数无效或当前无可设置定时器。
 int quic_recovery_get_timer(const quic_recovery_state_t *state,
                             const quic_in_flight_queue_t *const queues[QUIC_RECOVERY_PACKET_SPACE_COUNT],
                             int server_amplification_limited,
                             int has_handshake_keys,
                             uint64_t now_ms,
                             quic_recovery_timer_t *timer);
+// 功能：在恢复定时器触发时推进 loss/PTO 状态机。
+// 返回值：0 表示成功；< 0 表示参数无效或状态异常。
 int quic_recovery_on_timeout(quic_recovery_state_t *state,
                              quic_in_flight_queue_t *const queues[QUIC_RECOVERY_PACKET_SPACE_COUNT],
                              int server_amplification_limited,
@@ -165,6 +195,8 @@ int quic_recovery_on_timeout(quic_recovery_state_t *state,
                              void *observer_ctx,
                              quic_recovery_timer_t *timer,
                              size_t *lost_packets);
+// 功能：在丢弃某个包号空间时清理其恢复状态和 in-flight 队列。
+// 返回值：无。
 void quic_recovery_discard_space(quic_recovery_state_t *state,
                                  quic_in_flight_queue_t *q,
                                  uint8_t packet_number_space);

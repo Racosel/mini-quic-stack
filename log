@@ -299,3 +299,16 @@
 [2026-03-19 10:26:12 +0800] 阶段6第一批实现已落地：新增 include/quic_api.h 与 src/app/quic_api.c，在 quic_tls 之外提供稳定应用 API、事件队列、基础指标采样与 qlog 风格 JSON 事件格式化接口；下一步补 phase21/22/23 测试、app demo 示例和 Makefile/topo 同步。
 [2026-03-19 10:33:46 +0800] 阶段6编译与首轮验证开始：Makefile 已接入 quic-app-demo 与 test21/22/23，首轮执行 make TEST_REPEAT=1 quic-app-demo test21 test22 test23 时，quic_app_server/quic_app_client/test_phase21 已编译并通过；随后定位到 test_phase22 的 Makefile 重复链接 pkt_decode.c，已移除重复依赖并准备继续编译。
 [2026-03-19 10:43:37 +0800] 阶段6阶段性收口：已完成 quic_api、app demo、test21/22/23、README 阶段6状态同步、topo.py 的 app-demo-clean/app-demo-lossy profile 与 qlog 校验；验证通过 make test21 test22、提权执行 make test23（默认5轮）、make TEST_REPEAT=1 test18 test19 test20、python3 -m py_compile topo.py、python3 topo.py --auto --profile app-demo-clean --rounds 1。阶段6当前状态更新为“进行中，子阶段A已完成，外部 interop/HTTP3 未完成”。 
+[2026-03-19 10:50:23 +0800] 按用户要求开始阶段6下半部分“只调研与设计”：将对 xquic 作为 interop 对象的可行性、QUIC 适用 benchmark/测试工具做网络检索与筛选，并把结论同步到 README；本轮不编写协议代码。
+[2026-03-19 10:55:45 +0800] 已完成阶段6下半部分对象筛选与设计整理：README 新增 interop 对象筛选与 benchmark/测试框架筛选，当前结论为 xquic 作为首个外部互通对象，quic-interop-runner 负责 correctness/feature coverage，quic-network-simulator 负责 transport benchmark，h2load 暂缓到 HTTP/3 子阶段；本轮仅做网络调研与文档设计，不编写协议代码。
+[2026-03-19 10:57:55 +0800] 收到新的文档与流程要求：需要保留现有本机回环与 topo 测试链路，新增测试必要时可单开新的 topo 文件；同时开始通读 README 全文并按当前实现/验证进度修正过期状态与测试入口。
+[2026-03-19 11:05:11 +0800] 已按当前进度通读并更新 README：补齐阶段4/5/6 状态、功能矩阵、test15-test23、topo-stage5/stage6 入口、当前测试维护原则，并同步强调保留现有单元测试/本机回环/topo 链路；同时更新两个本地 skill，新增‘新测试不得破坏旧链路、必要时新开 topo 脚本、README 要通读全文同步进度’规则。
+[2026-03-19 11:18:15 +0800] 开始阶段6应用层接口与观测/fuzzing收口：先审阅现有 quic_api、phase21-23、example 与 Makefile，识别仍缺的对外 API、API 文档和 fuzzing 入口，再实施代码与文档补齐。
+[2026-03-19 11:29:55 +0800] 阶段6对外 API/观测/fuzzing 已完成一轮收口：新增根目录 API.md，扩展 quic_api 只读快照与 metrics JSON 导出接口，app 示例和 phase21/22 已切到公开 API，新增 tests/fuzz/quic_fuzz_smoke.c 与 Makefile fuzz-smoke 入口；验证通过 make TEST_REPEAT=1 test21 test22 fuzz-smoke，并在提权下通过 make TEST_REPEAT=1 test23。当前不涉及 interop 或 HTTP/3 代码。
+[2026-03-19 11:33:13 +0800] 收到新的文档/注释要求：将 API.md 扩展为逐 API 函数的功能与返回值说明，并开始为 include/ 中的公开函数声明补统一风格的功能/返回值注释；同时会把该工作风格写入本地 skill。
+[2026-03-19 11:42:55 +0800] 已完成 API.md 与公开头文件注释增强：API.md 改为逐函数记录功能与返回值；include/ 中的 quic_api/quic_tls/quic_stream/quic_connection/quic_recovery 及多份公共头文件已补‘功能 + 返回值’注释；并把该工作风格写入两个本地 skill。验证通过 make TEST_REPEAT=1 test21 test22 fuzz-smoke。
+[2026-03-19 11:59:32 +0800] 继续补接口注释：先扫描 include/ 中仍缺少‘功能 + 返回值’说明的公开函数声明，并准备在复杂实现函数前补少量逻辑注释。
+[2026-03-19 12:00:45 +0800] 继续补注释：扫描 include/ 与关键实现文件中仍缺功能/返回值或必要逻辑说明的接口。
+[2026-03-19 12:02:14 +0800] 已继续补充注释：统一 pkt_decode.h 的功能/返回值格式；补全 quic_tls.h 中 preferred-address、stateless reset、初始流控等接口说明；在 src/app/quic_api.c 与 src/transport/quic_stream.c 为事件队列、指标同步、可读事件、重传区间、流控提升与 STREAM 记账补充必要逻辑说明。验证通过 make TEST_REPEAT=1 test21 test22 fuzz-smoke。
+[2026-03-19 13:01:33 +0800] 继续补充恢复/迁移路径注释：扫描 loss_detector.c 与 quic_tls.c 中复杂的 ACK、PTO、timeout、path migration 逻辑。
+[2026-03-19 13:03:58 +0800] 已继续补充恢复/迁移路径注释：在 loss_detector.c 中为 ACK 驱动的 RTT/cwnd 更新、ECN/丢包拥塞判定、timer 选择与 PTO 语义补充逻辑说明；在 quic_tls.c 中为发包 path 选择、anti-amplification 阻塞、PTO probe、path validation 超时回退和 preferred-address 迁移时的 CID/active path 处理补充说明。验证通过 make TEST_REPEAT=1 test15 test16 test17 test19。

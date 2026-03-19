@@ -49,6 +49,7 @@ SRC_TEST_PHASE20 = tests/test_phase20.c
 SRC_TEST_PHASE21 = tests/test_phase21.c
 SRC_TEST_PHASE22 = tests/test_phase22.c
 SRC_TEST_PHASE23 = tests/test_phase23.c
+SRC_TEST_FUZZ_SMOKE = tests/fuzz/quic_fuzz_smoke.c
 
 BIN_TEST_PHASE1 = $(TEST_BIN_DIR)/test_phase1_bin
 BIN_TEST_PHASE2 = $(TEST_BIN_DIR)/test_phase2_bin
@@ -72,18 +73,19 @@ BIN_TEST_PHASE20 = $(TEST_BIN_DIR)/test_phase20_bin
 BIN_TEST_PHASE21 = $(TEST_BIN_DIR)/test_phase21_bin
 BIN_TEST_PHASE22 = $(TEST_BIN_DIR)/test_phase22_bin
 BIN_TEST_PHASE23 = $(TEST_BIN_DIR)/test_phase23_bin
+BIN_TEST_FUZZ_SMOKE = $(TEST_BIN_DIR)/quic_fuzz_smoke
 BIN_EXAMPLE_SERVER = $(TEST_BIN_DIR)/quic_server
 BIN_EXAMPLE_CLIENT = $(TEST_BIN_DIR)/quic_client
 BIN_APP_SERVER = $(TEST_BIN_DIR)/quic_app_server
 BIN_APP_CLIENT = $(TEST_BIN_DIR)/quic_app_client
 TEST_CERT = $(TEST_CERT_DIR)/server_cert.pem
 TEST_KEY = $(TEST_CERT_DIR)/server_key.pem
-BIN_TESTS = $(BIN_TEST_PHASE1) $(BIN_TEST_PHASE2) $(BIN_TEST_PHASE3) $(BIN_TEST_PHASE4) $(BIN_TEST_PHASE6) $(BIN_TEST_PHASE7) $(BIN_TEST_PHASE8) $(BIN_TEST_PHASE9) $(BIN_TEST_PHASE10) $(BIN_TEST_PHASE11) $(BIN_TEST_PHASE12) $(BIN_TEST_PHASE13) $(BIN_TEST_PHASE14) $(BIN_TEST_PHASE15) $(BIN_TEST_PHASE16) $(BIN_TEST_PHASE17) $(BIN_TEST_PHASE18) $(BIN_TEST_PHASE19) $(BIN_TEST_PHASE20) $(BIN_TEST_PHASE21) $(BIN_TEST_PHASE22) $(BIN_TEST_PHASE23)
+BIN_TESTS = $(BIN_TEST_PHASE1) $(BIN_TEST_PHASE2) $(BIN_TEST_PHASE3) $(BIN_TEST_PHASE4) $(BIN_TEST_PHASE6) $(BIN_TEST_PHASE7) $(BIN_TEST_PHASE8) $(BIN_TEST_PHASE9) $(BIN_TEST_PHASE10) $(BIN_TEST_PHASE11) $(BIN_TEST_PHASE12) $(BIN_TEST_PHASE13) $(BIN_TEST_PHASE14) $(BIN_TEST_PHASE15) $(BIN_TEST_PHASE16) $(BIN_TEST_PHASE17) $(BIN_TEST_PHASE18) $(BIN_TEST_PHASE19) $(BIN_TEST_PHASE20) $(BIN_TEST_PHASE21) $(BIN_TEST_PHASE22) $(BIN_TEST_PHASE23) $(BIN_TEST_FUZZ_SMOKE)
 
 
-.PHONY: all test1 test2 test3 test4 test5_1 test6 test7 test8 test9 test10 test11 test12 test13 test14 test15 test16 test17 test18 test19 test20 test21 test22 test23 example-certs quic-server quic-client quic-demo quic-app-server quic-app-client quic-app-demo topo-auto topo-auto-file topo-stage4-clean topo-stage4-lossy topo-stage5-preferred topo-stage6-clean topo-stage6-lossy clean net
+.PHONY: all test1 test2 test3 test4 test5_1 test6 test7 test8 test9 test10 test11 test12 test13 test14 test15 test16 test17 test18 test19 test20 test21 test22 test23 fuzz-smoke example-certs quic-server quic-client quic-demo quic-app-server quic-app-client quic-app-demo topo-auto topo-auto-file topo-stage4-clean topo-stage4-lossy topo-stage5-preferred topo-stage6-clean topo-stage6-lossy clean net
 
-all: $(BIN_TEST_PHASE1) $(BIN_TEST_PHASE2) $(BIN_TEST_PHASE3) $(BIN_TEST_PHASE4) $(BIN_TEST_PHASE6) $(BIN_TEST_PHASE7) $(BIN_TEST_PHASE8) $(BIN_TEST_PHASE9) $(BIN_TEST_PHASE10) $(BIN_TEST_PHASE11) $(BIN_TEST_PHASE12) $(BIN_TEST_PHASE13) $(BIN_TEST_PHASE14) $(BIN_TEST_PHASE15) $(BIN_TEST_PHASE16) $(BIN_TEST_PHASE17) $(BIN_TEST_PHASE18) $(BIN_TEST_PHASE19) $(BIN_TEST_PHASE20) $(BIN_TEST_PHASE21) $(BIN_TEST_PHASE22) $(BIN_TEST_PHASE23) $(BIN_EXAMPLE_SERVER) $(BIN_EXAMPLE_CLIENT) $(BIN_APP_SERVER) $(BIN_APP_CLIENT)
+all: $(BIN_TEST_PHASE1) $(BIN_TEST_PHASE2) $(BIN_TEST_PHASE3) $(BIN_TEST_PHASE4) $(BIN_TEST_PHASE6) $(BIN_TEST_PHASE7) $(BIN_TEST_PHASE8) $(BIN_TEST_PHASE9) $(BIN_TEST_PHASE10) $(BIN_TEST_PHASE11) $(BIN_TEST_PHASE12) $(BIN_TEST_PHASE13) $(BIN_TEST_PHASE14) $(BIN_TEST_PHASE15) $(BIN_TEST_PHASE16) $(BIN_TEST_PHASE17) $(BIN_TEST_PHASE18) $(BIN_TEST_PHASE19) $(BIN_TEST_PHASE20) $(BIN_TEST_PHASE21) $(BIN_TEST_PHASE22) $(BIN_TEST_PHASE23) $(BIN_TEST_FUZZ_SMOKE) $(BIN_EXAMPLE_SERVER) $(BIN_EXAMPLE_CLIENT) $(BIN_APP_SERVER) $(BIN_APP_CLIENT)
 
 $(BORINGSSL_LIBS):
 	cmake -S boringssl -B boringssl/build
@@ -261,6 +263,13 @@ $(BIN_TEST_PHASE23): $(SRC_TEST_PHASE23)
 test23: $(BIN_TEST_PHASE23) example-certs quic-app-demo
 	$(call RUN_REPEATED,test23,./$(BIN_TEST_PHASE23))
 
+$(BIN_TEST_FUZZ_SMOKE): $(SRC_TEST_FUZZ_SMOKE) src/packet/pkt_decode.c src/frame/frame_decode.c src/packet/quic_varint.c src/packet/quic_transport_params.c src/recovery/quic_ack.c src/recovery/loss_detector.c src/transport/quic_crypto_stream.c src/transport/quic_stream.c
+	mkdir -p $(@D)
+	$(CC) $(CFLAGS) $(INCLUDES) $^ -o $@
+
+fuzz-smoke: $(BIN_TEST_FUZZ_SMOKE)
+	$(call RUN_REPEATED,fuzz-smoke,./$(BIN_TEST_FUZZ_SMOKE))
+
 SRC_RECOVERY = src/recovery/loss_detector.c
 SRC_TEST_PHASE5_1 = tests/test_phase5_1.c
 BIN_TEST_PHASE5_1 = $(TEST_BIN_DIR)/test_phase5_1_bin
@@ -341,6 +350,11 @@ clean:
 	rm -rf $(TEST_BIN_DIR) $(TEST_CERT_DIR) $(TEST_DATA_DIR) __pycache__ $(TESTS_DIR)/__pycache__
 	rm -rf example/topo-transfer
 	rm -f test_phase*_bin example/quic_server example/quic_client example/server_cert.pem example/server_key.pem *.o
+	sudo mn -c > /dev/null 2>&1
+	-sudo fuser -k 6653/tcp > /dev/null 2>&1
+	-sudo fuser -k 4434/udp > /dev/null 2>&1 || true
+
+net-clean: clean
 	sudo mn -c > /dev/null 2>&1
 	-sudo fuser -k 6653/tcp > /dev/null 2>&1
 	-sudo fuser -k 4434/udp > /dev/null 2>&1 || true

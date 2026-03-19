@@ -550,6 +550,8 @@ int quic_recovery_on_ack_received(quic_recovery_state_t *state,
             quic_recovery_max(state->largest_acked_packet[packet_number_space], ack->largest_acked);
     }
 
+    // 先按 ACK range 从 in-flight 队列中摘除确认包，并把拥塞控制需要的元数据拷贝出来。
+    // 后面可能还要基于“本轮是否发生丢包/ECN 拥塞事件”决定能不能增长 cwnd。
     curr = q->head;
     while (curr) {
         quic_sent_packet_t *next = curr->next;
@@ -609,6 +611,7 @@ int quic_recovery_on_ack_received(quic_recovery_state_t *state,
                                  now_ms);
     }
 
+    // ECN CE 或显式丢包都会把这一轮 ACK 视为拥塞事件；发生拥塞时本轮不再继续扩张 cwnd。
     if (ack->has_ecn && ack->ecn_ce_count > state->ecn_ce_counters[packet_number_space]) {
         state->ecn_ce_counters[packet_number_space] = ack->ecn_ce_count;
         if (largest_acked_time_ms != 0) {
@@ -649,6 +652,7 @@ int quic_recovery_on_ack_received(quic_recovery_state_t *state,
         if (state->congestion_window < state->ssthresh) {
             state->congestion_window += packet->sent_bytes;
         } else if (state->congestion_window > 0) {
+            // Reno 拥塞避免阶段按 RFC 9002 的逐字节近似增长，避免每个 ACK 都加一个整包。
             state->congestion_window +=
                 (state->max_datagram_size * packet->sent_bytes) / state->congestion_window;
         }
@@ -703,6 +707,7 @@ int quic_recovery_get_timer(const quic_recovery_state_t *state,
         return 1;
     }
 
+    // Anti-amplification 命中时，服务端不能靠 recovery timer 继续探测，只能等更多入站字节解锁。
     if (server_amplification_limited) {
         return 0;
     }
@@ -713,6 +718,7 @@ int quic_recovery_get_timer(const quic_recovery_state_t *state,
 
     base_duration = quic_recovery_pto_base(state) << state->pto_count;
     if (state->bytes_in_flight == 0) {
+        // 没有在途包时仍保留 PTO：它负责驱动 crypto 数据或探测包重新发出，而不是等待永久静默。
         timer->mode = QUIC_RECOVERY_TIMER_PTO;
         timer->packet_number_space = (uint8_t)(has_handshake_keys ? 1 : 0);
         timer->deadline_ms = now_ms + base_duration;
@@ -795,6 +801,7 @@ int quic_recovery_on_timeout(quic_recovery_state_t *state,
                                                             lost_packets);
     }
 
+    // PTO 本身不直接重传具体包；它只提高探测计数，具体探测内容由上层按空间选择 crypto restart 或 probe。
     state->pto_count++;
     return 0;
 }

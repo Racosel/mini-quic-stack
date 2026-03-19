@@ -77,8 +77,14 @@ typedef struct {
     quic_version_information_param_t version_information;
 } quic_transport_params_t;
 
+// 功能：把 transport parameters 结构初始化为“未设置任何字段”的空状态。
+// 返回值：无。
 void quic_transport_params_init(quic_transport_params_t *params);
+// 功能：从字节串解码 QUIC transport parameters。
+// 返回值：0 表示成功；< 0 表示编码不合法、字段冲突或长度不足。
 int quic_transport_params_decode(const uint8_t *data, size_t len, quic_transport_params_t *params);
+// 功能：把 QUIC transport parameters 编码到输出缓冲区。
+// 返回值：>= 0 表示编码后的总长度；< 0 表示输出缓冲区不足或输入参数无效。
 int quic_transport_params_encode(const quic_transport_params_t *params, uint8_t *out, size_t out_len);
 
 #endif // QUIC_TRANSPORT_PARAMS_H：头文件保护结束

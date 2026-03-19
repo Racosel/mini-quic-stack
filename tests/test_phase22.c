@@ -142,33 +142,47 @@ static int handshake_done(const quic_api_conn_t *client, const quic_api_conn_t *
 }
 
 static void dump_conn_state(const char *label, const quic_api_conn_t *conn) {
-    const quic_tls_conn_t *raw = quic_api_conn_raw(conn);
-    const quic_stream_t *stream0;
+    quic_api_conn_info_t info;
+    quic_api_path_info_t path_info;
+    quic_api_stream_info_t stream0;
+    size_t i;
 
-    if (!label || !raw) {
+    if (!label || quic_api_conn_get_info(conn, &info) != 0) {
         return;
     }
-    stream0 = quic_stream_map_find_const(&raw->streams, 0);
     fprintf(stderr,
             "%s state=%d handshake=%u ping_received=%u has_output=%d bytes_sent=%llu bytes_recv=%llu pto=%llu cwnd=%llu bif=%llu\n",
             label,
-            (int)raw->conn.state,
-            raw->handshake_complete,
-            raw->ping_received,
-            quic_api_conn_has_pending_output(conn),
-            (unsigned long long)raw->bytes_sent,
-            (unsigned long long)raw->bytes_received,
-            (unsigned long long)raw->conn.recovery.pto_count,
-            (unsigned long long)raw->conn.recovery.congestion_window,
-            (unsigned long long)raw->conn.recovery.bytes_in_flight);
-    if (stream0) {
+            (int)info.state,
+            info.handshake_complete,
+            info.ping_received,
+            info.has_pending_output,
+            (unsigned long long)conn->metrics.bytes_sent,
+            (unsigned long long)conn->metrics.bytes_received,
+            (unsigned long long)conn->metrics.pto_count,
+            (unsigned long long)conn->metrics.congestion_window,
+            (unsigned long long)conn->metrics.bytes_in_flight);
+    if (quic_api_conn_get_stream_info(conn, 0, &stream0) == 0 && stream0.exists) {
         fprintf(stderr,
-                "  stream0 send_highest=%llu recv_highest=%llu recv_final_known=%u fin_received=%u fin_sent=%u\n",
-                (unsigned long long)stream0->send_highest_offset,
-                (unsigned long long)stream0->recv_highest_offset,
-                stream0->recv_final_size_known,
-                stream0->fin_received,
-                stream0->fin_sent);
+                "  stream0 send_highest=%llu recv_highest=%llu recv_final_known=%u fin_received=%u fin_sent=%u readable=%zu\n",
+                (unsigned long long)stream0.send_highest_offset,
+                (unsigned long long)stream0.recv_highest_offset,
+                stream0.recv_final_size_known,
+                stream0.fin_received,
+                stream0.fin_sent,
+                stream0.readable_bytes);
+    }
+    for (i = 0; i < info.path_count; i++) {
+        if (quic_api_conn_get_path_info(conn, i, &path_info) == 0) {
+            fprintf(stderr,
+                    "  path[%zu] state=%u local_port=%u peer_port=%u challenge_in_flight=%u response_pending=%u\n",
+                    i,
+                    path_info.state,
+                    path_info.local.port,
+                    path_info.peer.port,
+                    path_info.challenge_in_flight,
+                    path_info.response_pending);
+        }
     }
 }
 
@@ -227,10 +241,10 @@ static void drain_stream(quic_api_conn_t *conn,
 }
 
 static int server_ping_received(const quic_api_conn_t *client, const quic_api_conn_t *server) {
-    const quic_tls_conn_t *raw = quic_api_conn_raw(server);
+    quic_api_conn_info_t info;
 
     (void)client;
-    return raw && raw->ping_received;
+    return quic_api_conn_get_info(server, &info) == 0 && info.ping_received;
 }
 
 static void configure_pair(quic_api_conn_t *client,
@@ -279,7 +293,11 @@ static void test_stage6_metrics_events_and_parser_stress(void) {
     uint64_t stream_id = UINT64_MAX;
     quic_api_metrics_t metrics;
     quic_api_event_t event;
+    quic_api_conn_info_t info;
+    quic_api_path_info_t path_info;
+    quic_api_stream_info_t stream_info;
     char json[256];
+    char metrics_json[512];
     int saw_handshake_json = 0;
     int saw_ping_json = 0;
     int saw_readable_json = 0;
@@ -325,6 +343,21 @@ static void test_stage6_metrics_events_and_parser_stress(void) {
     assert(metrics.bytes_received > 0);
     assert(metrics.congestion_window > 0);
     assert(metrics.events_emitted > 0);
+    assert(quic_api_metrics_format_json(&metrics, metrics_json, sizeof(metrics_json)) == 0);
+    assert(strstr(metrics_json, "\"bytes_sent\":") != NULL);
+    assert(strstr(metrics_json, "\"congestion_window\":") != NULL);
+
+    assert(quic_api_conn_get_info(&client, &info) == 0);
+    assert(info.handshake_complete == 1);
+    assert(info.path_count >= 1);
+    assert(quic_api_conn_get_path_info(&client, info.active_path_index, &path_info) == 0);
+    assert(path_info.present == 1);
+    assert(path_info.state == QUIC_TLS_PATH_VALIDATED);
+    assert(quic_api_conn_get_stream_info(&server, stream_id, &stream_info) == 0);
+    assert(stream_info.exists == 1);
+    assert(stream_info.fin_received == 1);
+    assert(stream_info.recv_final_size_known == 1);
+    assert(stream_info.recv_final_size == sizeof(payload));
 
     while (quic_api_conn_poll_event(&client, &event) == 0) {
         assert(quic_api_event_format_json(&event, json, sizeof(json)) == 0);

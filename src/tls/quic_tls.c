@@ -3933,6 +3933,7 @@ int quic_tls_conn_build_next_datagram_on_path(quic_tls_conn_t *conn,
         return quic_tls_fail(conn, "invalid build_next_datagram arguments");
     }
     conn->tx_path_index = conn->active_path_index;
+    // 迁移/验证阶段优先把 probing 帧发到 pending path；普通业务流量默认仍走 active path。
     if (quic_tls_has_sendable_path_control(conn)) {
         conn->tx_path_index = conn->pending_path_index;
     } else if (conn->path_control_pending) {
@@ -3947,6 +3948,7 @@ int quic_tls_conn_build_next_datagram_on_path(quic_tls_conn_t *conn,
     if (conn->conn.state == QUIC_CONN_STATE_DRAINING || conn->conn.state == QUIC_CONN_STATE_CLOSED) {
         return quic_tls_fail(conn, "connection is not allowed to send packets");
     }
+    // 服务端在未验证地址的新 path 上必须遵守 anti-amplification 限制；命中时返回可恢复阻塞而不是致命错误。
     if (conn->role == QUIC_ROLE_SERVER &&
         tx_path &&
         conn->amplification_blocked &&
@@ -4040,6 +4042,7 @@ int quic_tls_conn_build_next_datagram_on_path(quic_tls_conn_t *conn,
         if (out_path && conn->tx_path_index < conn->path_count) {
             *out_path = conn->paths[conn->tx_path_index].addr;
         }
+        // probing 帧真正发完后才清 path_control_pending，避免被后续 build-blocked 提前吞掉。
         if (tx_path && !tx_path->challenge_pending && !tx_path->challenge_in_flight &&
             !tx_path->response_pending && !tx_path->response_in_flight &&
             conn->path_control_pending && conn->pending_path_index == conn->tx_path_index) {
@@ -4120,6 +4123,7 @@ void quic_tls_conn_on_loss_timeout(quic_tls_conn_t *conn, uint64_t now_ms) {
     if (timer.mode == QUIC_RECOVERY_TIMER_PTO) {
         const quic_sent_packet_t *probe = quic_recovery_oldest_unacked(queues[timer.packet_number_space]);
 
+        // 应用空间优先借最旧未确认包触发 probe；如果已经没有可复制的包，再退化成单独的 PING/crypto restart。
         if (probe) {
             quic_tls_on_packet_lost(conn, probe);
             if (probe->next && probe->next->is_ack_eliciting) {
@@ -4192,6 +4196,7 @@ void quic_tls_conn_on_timeout(quic_tls_conn_t *conn, uint64_t now_ms) {
             continue;
         }
 
+        // path validation 超时后只淘汰该 path；若它恰好是 active path，则回退到仍可用的已验证 path。
         path->state = QUIC_TLS_PATH_FAILED;
         path->challenge_pending = 0;
         path->challenge_in_flight = 0;
@@ -4323,6 +4328,7 @@ int quic_tls_conn_begin_migration(quic_tls_conn_t *conn, const quic_path_addr_t 
         return quic_tls_fail(conn, "no spare peer connection id for migration");
     }
 
+    // 迁移时先切换将要使用的 peer CID，并保留旧 CID 的序号，待路径稳定后再通过 RETIRE_CONNECTION_ID 回收。
     conn->active_peer_cid_index = selected_peer_index;
     conn->peer_cid = conn->peer_cids[selected_peer_index].cid;
     conn->peer_cid_known = 1;
@@ -4331,6 +4337,7 @@ int quic_tls_conn_begin_migration(quic_tls_conn_t *conn, const quic_path_addr_t 
         conn->retire_connection_id_pending = use_preferred_address ? 0 : 1;
     }
     if (use_preferred_address) {
+        // preferred-address 场景下不能在验证完成前立即切 active path，只记录“待切换”状态。
         conn->preferred_migration_pending = 1;
         conn->preferred_migration_path_index = index;
     } else {
